@@ -915,5 +915,25 @@ export default async function (pi: ExtensionAPI) {
 			// Ignore persist errors
 		}
 	});
+
+	// Catch process termination (Ctrl-D / container exit) to save slots
+	// These events fire before the process exits, even when pi doesn't
+	// explicitly emit session_shutdown.
+	const saveOnExit = () => {
+		if (currentSlotId !== null && currentlyLoadedModel) {
+			persistSlotCheckpoint(currentlyLoadedModel, currentSlotId);
+			saveSlot(currentSlotId);
+		}
+	};
+	process.on("SIGTERM", saveOnExit);
+	process.on("SIGINT", saveOnExit);
+
+	// Also save on process exit as a last resort (sync, no awaits)
+	process.on("exit", () => {
+		if (currentSlotId !== null && currentlyLoadedModel) {
+			persistSlotCheckpoint(currentlyLoadedModel, currentSlotId);
+			saveSlot(currentSlotId);
+		}
+	});
 	// ─────────────────────────────────────────────────────────────────────
 }
