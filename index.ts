@@ -394,7 +394,7 @@ export default async function (pi: ExtensionAPI) {
 		},
 	});
 
-	const baseUrl = (process.env.LLAMA_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
+	const baseUrl = (process.env.LLAMA_BASE_URL ?? process.env.LLAMA_SERVER_URL ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
 	const apiKey = process.env.LLAMA_API_KEY ?? "no-key";
 	_baseUrl = baseUrl;
 	slotPersistFn = pi.appendEntry.bind(pi);
