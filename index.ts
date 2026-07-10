@@ -768,11 +768,59 @@ export default async function (pi: ExtensionAPI) {
 		}
 	});
 
+	const pendingSlotDiscoveries = new Set<string>();
+
+	function discoverSlotForModel(modelId: string, ctx?: ExtensionCtx): void {
+		if (pendingSlotDiscoveries.has(modelId)) {
+			return;
+		}
+		pendingSlotDiscoveries.add(modelId);
+
+		void (async () => {
+			try {
+				const response = await fetch(`${baseUrl}/models`);
+				if (!response.ok) return;
+				const payload: unknown = await response.json();
+				if (!validateModelsResponse.Check(payload)) return;
+
+				const models = payload.data as Array<{
+					id: string;
+					status?: { value?: string };
+				}>;
+
+				const loaded = models.find(
+					(m) => m.id === modelId && m.status?.value === "loaded",
+				);
+
+				// Even if not loaded, record this model as known so
+				// discoverSlots can pick it up after autoload.
+				discoveredMetadata.add(modelId);
+
+				if (loaded) {
+					await discoverSlots();
+					const slotName = modelId
+						.split("/")
+						.join("_")
+						.replace(/[^a-zA-Z0-9_]/g, "_");
+					ctx?.ui.notify(
+						`[llama-cpp] Slot ${currentSlotId ?? "(none)"} active for ${modelId}`,
+						"info",
+					);
+				}
+			} catch {
+				// Non-fatal
+			} finally {
+				pendingSlotDiscoveries.delete(modelId);
+			}
+		})();
+	}
+
 	pi.on("model_select", (event, ctx) => {
 		if (event.model.provider !== PROVIDER_ID) {
 			return;
 		}
 		void discoverModelMetadata(event.model.id, ctx, true, PROPS_TIMEOUT_MS, event.model);
+		discoverSlotForModel(event.model.id, ctx);
 	});
 
 	pi.on("before_provider_request", (event, ctx) => {
