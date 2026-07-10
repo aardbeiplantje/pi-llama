@@ -307,10 +307,10 @@ export default async function (pi: ExtensionAPI) {
 	});
 
 	// -----------------------------------------------------------------------
-	// Slot commands
+	// Slots commands
 	// -----------------------------------------------------------------------
 
-	pi.registerCommand("slot", {
+	pi.registerCommand("slots", {
 		description: "Manage llama.cpp KV cache slots (manual save/restore)",
 		handler: async (args, ctx) => {
 			const sub = args[0]?.toString().trim().toLowerCase() || "";
@@ -346,7 +346,7 @@ export default async function (pi: ExtensionAPI) {
 					const slotId = typeof slotIdArg === "number" ? slotIdArg : parseInt(slotIdArg?.toString() ?? "");
 					if (isNaN(slotId)) {
 						ctx.ui.notify(
-							"[llama-cpp] Usage: /slot restore <slot_id>",
+							"[llama-cpp] Usage: /slots restore <slot_id>",
 							"error",
 						);
 						return;
@@ -385,8 +385,8 @@ export default async function (pi: ExtensionAPI) {
 					lines.push(`  Model: ${activeModelName ?? "(none)"} `);
 					lines.push(`  Current slot: ${currentSlotId ?? "(none)"}`);
 					lines.push(`  Usage:`);
-					lines.push(`    /slot save          — save current slot to disk`);
-					lines.push(`    /slot restore <id>  — restore slot <id> from disk`);
+					lines.push(`    /slots save          — save current slot to disk`);
+					lines.push(`    /slots restore <id>  — restore slot <id> from disk`);
 					ctx.ui.notify(lines.join("\n"), "info");
 					break;
 				}
@@ -679,60 +679,57 @@ export default async function (pi: ExtensionAPI) {
 
 			const response = await fetch(propsUrl, { signal: propsAbortController.signal });
 			if (!response.ok) {
-				if (!(shouldAutoload && response.status === 500)) {
-					ctx?.ui.notify(`[llama-cpp] /props for ${modelId} returned ${response.status}`, "error");
+				// /props failure is non-blocking — slot saving is best-effort,
+				// prompt processing will take over if the slot is not available.
+				if (shouldAutoload && response.status === 500) {
+					// autoload returned 500 — the model is loading, just skip metadata
+					console.warn(`[llama-cpp] /props for ${modelId} returned ${response.status} (model is loading, skipping metadata)`);
+				} else {
+					console.warn(`[llama-cpp] /props for ${modelId} returned ${response.status}`);
 				}
-				return;
-			}
-			const data: unknown = await response.json();
-			if (!validatePropsResponse.Check(data)) {
-				const errors = [...validatePropsResponse.Errors(data)]
-					.map((e) => `${"path" in e ? e.path : ""} ${e.message}`)
-					.join("; ");
-				ctx?.ui.notify(`[llama-cpp] invalid /props response for ${modelId}: ${errors}`, "error");
-				return;
-			}
-			const nCtx = data.default_generation_settings?.n_ctx;
-			let updated = false;
-			let loadedFooterStatus = shouldAutoload ? `[llama.cpp] ${displayName} loaded` : undefined;
-			if (typeof nCtx === "number" && nCtx > 0) {
-				model.contextWindow = nCtx;
-				model.maxTokens = Math.min(DEFAULT_MAX_TOKENS, nCtx);
-				loadedFooterStatus = `[llama.cpp] ${displayName} loaded with ctx ${nCtx} tokens`;
-				updated = true;
-			}
-			if (selectedModel) {
-				selectedModel.contextWindow = model.contextWindow;
-				selectedModel.maxTokens = model.maxTokens;
-			}
-			if (data.chat_template?.includes("enable_thinking") === true) {
-				applyTemplateThinkingSupport(model);
-				if (selectedModel) {
-					applyTemplateThinkingSupport(selectedModel);
-					if (pi.getThinkingLevel() === "off") {
-						pi.setThinkingLevel("medium");
+			} else {
+				const data: unknown = await response.json();
+				if (validatePropsResponse.Check(data)) {
+					const nCtx = data.default_generation_settings?.n_ctx;
+					let loadedFooterStatus = shouldAutoload ? `[llama.cpp] ${displayName} loaded` : undefined;
+					if (typeof nCtx === "number" && nCtx > 0) {
+						model.contextWindow = nCtx;
+						model.maxTokens = Math.min(DEFAULT_MAX_TOKENS, nCtx);
+						loadedFooterStatus = `[llama.cpp] ${displayName} loaded with ctx ${nCtx} tokens`;
 					}
+					if (selectedModel) {
+						selectedModel.contextWindow = model.contextWindow;
+						selectedModel.maxTokens = model.maxTokens;
+					}
+					if (data.chat_template?.includes("enable_thinking") === true) {
+						applyTemplateThinkingSupport(model);
+						if (selectedModel) {
+							applyTemplateThinkingSupport(selectedModel);
+							if (pi.getThinkingLevel() === "off") {
+								pi.setThinkingLevel("medium");
+							}
+						}
+					}
+					if (loadedFooterStatus && ctx && !isLoaded) {
+						const nCtxVal = data.default_generation_settings?.n_ctx;
+						const prefix = ctx.ui.theme.fg("success", "[llama.cpp] ✓");
+						ctx.ui.setWidget(PROVIDER_ID, [
+							prefix +
+								ctx.ui.theme.fg(
+									"text",
+									` ${displayName}: Loaded` + (nCtxVal ? ` with context ${nCtxVal} tokens` : ""),
+								),
+						]);
+						clearFooterStatusLater();
+					}
+				} else {
+					const errors = [...validatePropsResponse.Errors(data)]
+						.map((e) => `${"path" in e ? e.path : ""} ${e.message}`)
+						.join("; ");
+					console.warn(`[llama-cpp] invalid /props response for ${modelId}: ${errors} (non-blocking, slot saving is best-effort)`);
 				}
-				updated = true;
 			}
-			discoveredMetadata.add(modelId);
-			if (shouldAutoload) {
-				currentlyLoadedModel = modelId;
-			}
-			if (loadedFooterStatus && ctx && !isLoaded) {
-				const prefix = ctx.ui.theme.fg("success", "[llama.cpp] ✓");
-				ctx.ui.setWidget(PROVIDER_ID, [
-					prefix +
-						ctx.ui.theme.fg(
-							"text",
-							` ${displayName}: Loaded` + (nCtx ? ` with context ${nCtx} tokens` : ""),
-						),
-				]);
-				clearFooterStatusLater();
-			}
-			if (!updated) {
-				return;
-			}
+			// Always register the provider so the model is selectable even without /props metadata
 			pi.registerProvider(PROVIDER_ID, {
 				name: "llama.cpp",
 				baseUrl,
@@ -743,9 +740,14 @@ export default async function (pi: ExtensionAPI) {
 		} catch (error) {
 			const err = error as Error;
 			if (err.name !== "AbortError" && !isStaleContextError(err)) {
-				ctx?.ui.notify(`[llama-cpp] /props for ${modelId} failed: ${err.message}`, "error");
+				console.warn(`[llama-cpp] /props for ${modelId} failed: ${err.message} (non-blocking, slot saving is best-effort)`);
 			}
 		} finally {
+			// Always mark metadata as discovered and model as loaded — /props is best-effort
+			discoveredMetadata.add(modelId);
+			if (shouldAutoload) {
+				currentlyLoadedModel = modelId;
+			}
 			clearTimeout(timer);
 			pendingMetadata.delete(modelId);
 			propsAbortController = null;
