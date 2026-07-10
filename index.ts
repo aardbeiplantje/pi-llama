@@ -3,8 +3,6 @@
  *
  * Auto-discovers models from a running `llama-server` and
  * registers them under the `llama-cpp` provider.
- *
- * Usage: `pi install github.com/huggingface/pi-llama`
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -14,212 +12,151 @@ import { Loader, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 const PROVIDER_ID = "llama-cpp";
 const DEFAULT_BASE_URL = "http://localhost:8080/v1";
-const DEFAULT_SLOT_SAVE_PATH = "/tmp/llama.cpp/slots";
 // Fallback for /v1/models entries missing meta.n_ctx.
 const DEFAULT_CONTEXT_WINDOW = 8192;
-// llama.cpp has no output-token cap (no endpoint reports one; generation is only
-// bounded by the context window), so use Pi's own default for models that omit
-// maxTokens (see model-registry.ts parseModels).
 const DEFAULT_MAX_TOKENS = 16384;
 const PROPS_TIMEOUT_MS = 120_000;
 
 // ---------------------------------------------------------------------------
-// Slot save/restore
+// Slot tracking — manual save/restore
 // ---------------------------------------------------------------------------
 // llama.cpp exposes POST /slots/<id>?action=save|restore. The server does NOT
-// auto-save — we must call the API ourselves.
+// auto-save — we call the API manually via /slot commands.
+//
+// The slot ID is injected into every llama.cpp provider request so the server
+// reuses the same KV cache slot for the current session.
 
 interface SlotCheckpoint {
-  slotId: number;
-  modelName: string;
-  modelProvider: string;
-  filename: string;
-  timestamp: number;
-  sessionId: string;
-}
-
-interface SlotEntry {
-  slotId: number;
-  modelName: string;
-  modelProvider: string;
-  filename: string;
-  timestamp: number;
+	slotId: number;
+	modelName: string;
+	modelProvider: string;
+	filename: string;
+	timestamp: number;
+	sessionId: string;
 }
 
 interface SlotSaveRequestBody {
-  filename: string;
-  model: string;
+	filename: string;
+	model: string;
 }
 
-// Slot state (populated at runtime inside the factory)
-let slotIdByModel: Map<string, number> = new Map();
+// Global slot state
 let currentSlotId: number | null = null;
-let slotCheckpoints: SlotCheckpoint[] = [];
-let slotFileSavePath: string = DEFAULT_SLOT_SAVE_PATH;
-let lastSessionFile: string | null = null;
-let slotPersistFn: ((customType: string, data?: unknown) => void) | null = null;
-
-/** The currently loaded model name(s) used for slot save/restore */
 let activeModelName: string | null = null;
-
-// ---------------------------------------------------------------------------
-// Slot API helpers (capture baseUrl at runtime to avoid closure issues)
-// ---------------------------------------------------------------------------
+let slotPersistFn: ((customType: string, data?: unknown) => void) | null = null;
 let _baseUrl: string = DEFAULT_BASE_URL;
 
-async function saveSlot(slotId: number): Promise<void> {
-  const serverUrl = _baseUrl.replace(/\/v1$/, "");
-  if (!activeModelName) {
-    console.warn(`[llama-cpp] saveSlot(${slotId}) — no active model name`);
-    return;
-  }
-  // Generate a checkpoint filename
-  const slotName = activeModelName.split("/").join("_").replace(/[^a-zA-Z0-9_]/g, "_");
-  const filename = `${slotName}_${slotId}.kv`;
-  const body: SlotSaveRequestBody = {
-    filename,
-    model: activeModelName,
-  };
-  try {
-    const res = await fetch(`${serverUrl}/slots/${slotId}?action=save`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      const errText = await res.text();
-      console.warn(`[llama-cpp] saveSlot(${slotId}) ${res.status}: ${errText}`);
-    } else {
-      const result = await res.json();
-      const nWritten = (result as { n_written?: number })?.n_written;
-      if (nWritten) {
-        console.log(`[llama-cpp] slot ${slotId} saved ${nWritten} tokens to ${filename}`);
-      }
-    }
-  } catch (error) {
-    console.warn(`[llama-cpp] saveSlot(${slotId}) failed: ${(error as Error).message}`);
-  }
+async function saveSlot(slotId: number): Promise<boolean> {
+	const serverUrl = _baseUrl.replace(/\/v1$/, "");
+	if (!activeModelName) {
+		console.warn(`[llama-cpp] saveSlot(${slotId}) — no active model name`);
+		return false;
+	}
+	const slotName = activeModelName.split("/").join("_").replace(/[^a-zA-Z0-9_]/g, "_");
+	const filename = `${slotName}_${slotId}.kv`;
+	const body: SlotSaveRequestBody = { filename, model: activeModelName };
+	try {
+		const res = await fetch(`${serverUrl}/slots/${slotId}?action=save`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(body),
+		});
+		if (!res.ok) {
+			const errText = await res.text();
+			console.warn(`[llama-cpp] saveSlot(${slotId}) ${res.status}: ${errText}`);
+			return false;
+		}
+		const result = await res.json();
+		const nWritten = (result as { n_written?: number })?.n_written;
+		console.log(`[llama-cpp] slot ${slotId} saved ${nWritten ?? "??"} tokens to ${filename}`);
+		return true;
+	} catch (error) {
+		console.warn(`[llama-cpp] saveSlot(${slotId}) failed: ${(error as Error).message}`);
+		return false;
+	}
 }
 
-async function restoreSlot(slotId: number, filename: string): Promise<void> {
-  const serverUrl = _baseUrl.replace(/\/v1$/, "");
-  if (!activeModelName) {
-    console.warn(`[llama-cpp] restoreSlot(${slotId}) — no active model name`);
-    return;
-  }
-  const body: SlotSaveRequestBody = {
-    filename,
-    model: activeModelName,
-  };
-  try {
-    const res = await fetch(`${serverUrl}/slots/${slotId}?action=restore`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      const errText = await res.text();
-      console.warn(`[llama-cpp] restoreSlot(${slotId}) ${res.status}: ${errText}`);
-    } else {
-      const result = await res.json();
-      const nWritten = (result as { n_written?: number })?.n_written;
-      if (nWritten) {
-        console.log(`[llama-cpp] slot ${slotId} restored ${nWritten} tokens from ${filename}`);
-      }
-    }
-  } catch (error) {
-    console.warn(`[llama-cpp] restoreSlot(${slotId}) failed: ${(error as Error).message}`);
-  }
+async function restoreSlot(slotId: number, filename: string): Promise<boolean> {
+	const serverUrl = _baseUrl.replace(/\/v1$/, "");
+	if (!activeModelName) {
+		console.warn(`[llama-cpp] restoreSlot(${slotId}) — no active model name`);
+		return false;
+	}
+	const body: SlotSaveRequestBody = { filename, model: activeModelName };
+	try {
+		const res = await fetch(`${serverUrl}/slots/${slotId}?action=restore`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(body),
+		});
+		if (!res.ok) {
+			const errText = await res.text();
+			console.warn(`[llama-cpp] restoreSlot(${slotId}) ${res.status}: ${errText}`);
+			return false;
+		}
+		const result = await res.json();
+		const nWritten = (result as { n_written?: number })?.n_written;
+		console.log(`[llama-cpp] slot ${slotId} restored ${nWritten ?? "??"} tokens from ${filename}`);
+		return true;
+	} catch (error) {
+		console.warn(`[llama-cpp] restoreSlot(${slotId}) failed: ${(error as Error).message}`);
+		return false;
+	}
 }
 
-/**
- * Discover active slots from the /slots endpoint. We need to know the
- * numeric slot IDs assigned by llama.cpp and the associated model name.
- */
 async function discoverSlots(): Promise<void> {
-  try {
-    const res = await fetch(`${_baseUrl}/models`);
-    if (!res.ok) return;
-    const payload = await res.json();
-    if (!payload.data) return;
+	try {
+		const res = await fetch(`${_baseUrl}/models`);
+		if (!res.ok) return;
+		const payload = await res.json();
+		if (!payload.data) return;
 
-    // Find the currently loaded model name
-    for (const model of payload.data as Array<{ id: string; status?: { value?: string } }>) {
-      if (model.status?.value === "loaded") {
-        activeModelName = model.id;
-        currentSlotId = null;
-        slotIdByModel.clear();
-      }
-    }
-    if (!activeModelName) return;
+		// Find currently loaded model name(s)
+		for (const model of payload.data as Array<{ id: string; status?: { value?: string } }>) {
+			if (model.status?.value === "loaded") {
+				activeModelName = model.id;
+			}
+		}
+		if (!activeModelName) return;
 
-    // Query /slots endpoint to get numeric slot IDs
-    const slotsRes = await fetch(`${_baseUrl.replace(/\/v1$/, "")}/slots?model=${encodeURIComponent(activeModelName)}`);
-    if (!slotsRes.ok) return;
-    const slotsData = await slotsRes.json();
-    if (!Array.isArray(slotsData)) return;
+		// Query /slots endpoint to get numeric slot IDs
+		const slotsRes = await fetch(
+			`${_baseUrl.replace(/\/v1$/, "")}/slots?model=${encodeURIComponent(activeModelName)}`,
+		);
+		if (!slotsRes.ok) return;
+		const slotsData = await slotsRes.json();
+		if (!Array.isArray(slotsData)) return;
 
-    for (const slot of slotsData as Array<{ id: number }>) {
-      slotIdByModel.set(activeModelName, slot.id);
-      // Prefer idle slots (no task running)
-    }
-    console.log(`[llama-cpp] discovered ${slotsData.length} slots for ${activeModelName}`);
-  } catch {
-    // Non-fatal — slots may not be configured or server is unreachable
-  }
+		const idleSlot = slotsData.find((s: { id: number; is_processing?: boolean }) => !s.is_processing);
+		if (idleSlot) {
+			currentSlotId = idleSlot.id;
+			console.log(`[llama-cpp] selected slot ${currentSlotId} (idle) for ${activeModelName}`);
+		}
+	} catch {
+		// Non-fatal
+	}
 }
 
-function persistSlotCheckpoint(modelName: string, slotId: number): void {
-  const slotName = modelName.split("/").join("_").replace(/[^a-zA-Z0-9_]/g, "_");
-  const filename = `${slotName}_${slotId}.kv`;
-  const checkpoint: SlotCheckpoint = {
-    slotId,
-    modelName,
-    modelProvider: PROVIDER_ID,
-    filename,
-    timestamp: Date.now(),
-    sessionId: lastSessionFile ?? "",
-  };
-  // Deduplicate: update existing checkpoint for the same slotId
-  const existingIdx = slotCheckpoints.findIndex((c) => c.slotId === slotId);
-  if (existingIdx >= 0) {
-    slotCheckpoints[existingIdx] = checkpoint;
-  } else {
-    slotCheckpoints.push(checkpoint);
-  }
-  // Persist to session file for cross-session survival
-  try {
-    slotPersistFn?.("llama-cpp-slot", {
-      type: "slot_checkpoint",
-      slotId,
-      modelName,
-      modelProvider: PROVIDER_ID,
-      filename,
-      timestamp: checkpoint.timestamp,
-    });
-  } catch {
-    // Session may not support custom entries; ignore
-  }
+function persistSlotCheckpointToSession(slotId: number, modelName: string): void {
+	const slotName = modelName.split("/").join("_").replace(/[^a-zA-Z0-9_]/g, "_");
+	const filename = `${slotName}_${slotId}.kv`;
+	try {
+		slotPersistFn?.("llama-cpp-slot", {
+			type: "slot_checkpoint",
+			slotId,
+			modelName,
+			modelProvider: PROVIDER_ID,
+			filename,
+			timestamp: Date.now(),
+		});
+	} catch {
+		// Ignore persist errors
+	}
 }
 
-function findSlotCheckpoint(modelName: string): SlotCheckpoint | undefined {
-  // Prefer checkpoint from the same session, fall back to most recent
-  return (
-    slotCheckpoints.find((c) => c.sessionId === lastSessionFile && c.modelName === modelName) ??
-    slotCheckpoints.find((c) => c.modelName === modelName) ??
-    slotCheckpoints.find((c) => c.sessionId === "")
-  );
-}
-
-/**
- * Load any previously persisted slot checkpoints from the current session file.
- */
-function loadSlotCheckpointsFromSession(): void {
-  // This is called from session_start and populates slotCheckpoints.
-  // We can't access ctx here, so we rely on appendEntry being called during
-  // model_select and session_shutdown. The checkpoints are kept in memory.
-}
-
+// ---------------------------------------------------------------------------
+// Provider / models
+// ---------------------------------------------------------------------------
 
 const ModelsResponseSchema = Type.Object({
 	data: Type.Optional(
@@ -338,11 +275,13 @@ function isStaleContextError(error: unknown): boolean {
 
 export default async function (pi: ExtensionAPI) {
 	let currentModels: LlamaModel[] = [];
+	let currentlyLoadedModel: string | null = null;
+	let currentSessionFile: string | null = null;
 
 	pi.registerCommand("llama-version", {
 		description: "Get build info of llama.cpp server",
 		handler: async (_args, ctx) => {
-			const response = await fetch(`${baseUrl.replace(/\/v1$/, "")}/props`);
+			const response = await fetch(`${_baseUrl.replace(/\/v1$/, "")}/props`);
 			if (!response.ok) {
 				ctx.ui.notify(`[llama-cpp] /props returned ${response.status}`, "error");
 				return;
@@ -367,35 +306,97 @@ export default async function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerCommand("slots", {
-		description: "List saved slot checkpoints for llama.cpp",
-		handler: async (_args, ctx) => {
-			// Refresh slots from the server
-			await discoverSlots();
+	// -----------------------------------------------------------------------
+	// Slot commands
+	// -----------------------------------------------------------------------
 
-			const lines: string[] = [];
-			lines.push(`[llama-cpp] Saved slot checkpoints (${slotCheckpoints.length}):`);
+	pi.registerCommand("slot", {
+		description: "Manage llama.cpp KV cache slots (manual save/restore)",
+		handler: async (args, ctx) => {
+			const sub = args[0]?.toString().trim().toLowerCase() || "";
+			const slotIdArg = args[1];
 
-			if (slotCheckpoints.length === 0) {
-				lines.push("  (none — switch models or use /model to create checkpoints)");
-			} else {
-				for (const cp of slotCheckpoints) {
-					const modelName = cp.modelName.split("/").pop() || cp.modelName;
-					const date = new Date(cp.timestamp).toLocaleString();
-					const active = currentSlotId === cp.slotId ? " ✓" : "";
-					lines.push(`  ${cp.slotId} → ${modelName} (${cp.filename}, ${date})${active}`);
+			switch (sub) {
+				case "save": {
+					await discoverSlots();
+					if (currentSlotId === null || activeModelName === null) {
+						ctx.ui.notify(
+							"[llama-cpp] No loaded model or slot found. Select a model first.",
+							"error",
+						);
+						return;
+					}
+					ctx.ui.notify(
+						`[llama-cpp] Saving slot ${currentSlotId} for ${activeModelName}...`,
+						"info",
+					);
+					const ok = await saveSlot(currentSlotId);
+					if (ok) {
+						persistSlotCheckpointToSession(currentSlotId, activeModelName);
+						ctx.ui.notify(
+							`[llama-cpp] Slot ${currentSlotId} saved. Session file updated.`,
+							"success",
+						);
+					} else {
+						ctx.ui.notify(`[llama-cpp] Failed to save slot ${currentSlotId}`, "error");
+					}
+					break;
+				}
+				case "restore": {
+					const slotId = typeof slotIdArg === "number" ? slotIdArg : parseInt(slotIdArg?.toString() ?? "");
+					if (isNaN(slotId)) {
+						ctx.ui.notify(
+							"[llama-cpp] Usage: /slot restore <slot_id>",
+							"error",
+						);
+						return;
+					}
+					await discoverSlots();
+					if (activeModelName === null) {
+						ctx.ui.notify(
+							"[llama-cpp] No loaded model found. Select a model first.",
+							"error",
+						);
+						return;
+					}
+					const slotName = activeModelName.split("/").join("_").replace(/[^a-zA-Z0-9_]/g, "_");
+					const filename = `${slotName}_${slotId}.kv`;
+					ctx.ui.notify(
+						`[llama-cpp] Restoring slot ${slotId} from ${filename} for ${activeModelName}...`,
+						"info",
+					);
+					const ok = await restoreSlot(slotId, filename);
+					if (ok) {
+						currentSlotId = slotId;
+						ctx.ui.notify(
+							`[llama-cpp] Slot ${slotId} restored. Will be used for all requests.`,
+							"success",
+						);
+					} else {
+						ctx.ui.notify(`[llama-cpp] Failed to restore slot ${slotId}`, "error");
+					}
+					break;
+				}
+				case "status":
+				default: {
+					await discoverSlots();
+					const lines: string[] = [];
+					lines.push(`[llama-cpp] Slot status:`);
+					lines.push(`  Model: ${activeModelName ?? "(none)"} `);
+					lines.push(`  Current slot: ${currentSlotId ?? "(none)"}`);
+					lines.push(`  Usage:`);
+					lines.push(`    /slot save          — save current slot to disk`);
+					lines.push(`    /slot restore <id>  — restore slot <id> from disk`);
+					ctx.ui.notify(lines.join("\n"), "info");
+					break;
 				}
 			}
-
-			ctx.ui.notify(lines.join("\n"), "info");
 		},
 	});
 
 	const baseUrl = (process.env.LLAMA_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
 	const apiKey = process.env.LLAMA_API_KEY ?? "no-key";
-	// Update the module-level baseUrl reference used by slot API helpers
 	_baseUrl = baseUrl;
-	// Wire up appendEntry for slot checkpoint persistence
 	slotPersistFn = pi.appendEntry.bind(pi);
 
 	async function refreshProvider(): Promise<void> {
@@ -437,8 +438,6 @@ export default async function (pi: ExtensionAPI) {
 				return {
 					id: model.id,
 					name: suffixes.length > 0 ? `${displayName} ${suffixes.join(" ")}` : displayName,
-					// /v1/models does not include /props-discovered capabilities, so preserve
-					// template thinking metadata across refreshes.
 					reasoning: previous?.reasoning ?? false,
 					thinkingLevelMap: previous?.thinkingLevelMap,
 					input,
@@ -455,7 +454,6 @@ export default async function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// Track which model is currently loaded on the server
 			const loadedModel = currentModels.find((m) => m.status?.value === "loaded");
 			currentlyLoadedModel = loadedModel?.id ?? null;
 
@@ -473,7 +471,6 @@ export default async function (pi: ExtensionAPI) {
 
 	const discoveredMetadata = new Set<string>();
 	const pendingMetadata = new Set<string>();
-	let currentlyLoadedModel: string | null = null;
 	let statusTimeout: ReturnType<typeof setTimeout> | undefined;
 	let sseAbortController: AbortController | null = null;
 	let propsAbortController: AbortController | null = null;
@@ -485,13 +482,11 @@ export default async function (pi: ExtensionAPI) {
 		}
 	}
 
-	// Connect to SSE stream for model loading progress
 	async function connectToLoadingProgress(
 		modelId: string,
 		ctx: ExtensionCtx,
 		loader: Loader,
 	): Promise<void> {
-		// Close any existing SSE connection
 		if (sseAbortController) {
 			sseAbortController.abort();
 			sseAbortController = null;
@@ -533,7 +528,6 @@ export default async function (pi: ExtensionAPI) {
 						continue;
 					}
 
-					// Parse SSE record: extract data lines
 					const dataLines = event
 						.split("\n")
 						.filter((line) => line.startsWith("data:"))
@@ -547,8 +541,6 @@ export default async function (pi: ExtensionAPI) {
 					try {
 						const sseEvent: ApiModelsSseEvent = JSON.parse(dataLines);
 
-						// Process status events for all models to keep discoveredMetadata and
-						// currentlyLoadedModel in sync.
 						if (
 							sseEvent.event === "model_status" ||
 							sseEvent.event === "status_change" ||
@@ -567,7 +559,6 @@ export default async function (pi: ExtensionAPI) {
 							}
 						}
 
-						// Progress UI is only for the model we're actively loading
 						if (sseEvent.model === modelId) {
 							const currentModel = currentModels.find((m) => m.id === sseEvent.model);
 							const displayName = currentModel?.name.split(" ")[0] || sseEvent.model;
@@ -599,8 +590,6 @@ export default async function (pi: ExtensionAPI) {
 				}
 			}
 		} catch (error) {
-			// Suppress errors from intentionally-aborted SSE connections and from a
-			// stale ctx (session was replaced while streaming).
 			const msg = (error as Error).message;
 			if (
 				isStaleContextError(error) ||
@@ -626,15 +615,12 @@ export default async function (pi: ExtensionAPI) {
 			return;
 		}
 		const displayName = model.name.split(" ")[0];
-		// Use tracked state instead of stale currentModels status.
 		const isLoaded = currentlyLoadedModel === modelId;
 
 		if (discoveredMetadata.has(modelId)) {
-			// If discovered but no longer loaded, clear cache and fall through to reload.
 			if (!isLoaded) {
 				discoveredMetadata.delete(modelId);
 			} else {
-				// Copy cached metadata into the selected model snapshot.
 				if (selectedModel) {
 					selectedModel.contextWindow = model.contextWindow;
 					selectedModel.maxTokens = model.maxTokens;
@@ -652,9 +638,7 @@ export default async function (pi: ExtensionAPI) {
 		}
 
 		pendingMetadata.add(modelId);
-		// Cancel any pending clear timeout from a previous model load.
 		clearFooterStatusTimeout();
-		// Abort any in-flight /props request from a previous model.
 		if (propsAbortController) {
 			propsAbortController.abort();
 		}
@@ -690,14 +674,11 @@ export default async function (pi: ExtensionAPI) {
 						},
 					};
 				});
-				// Start SSE connection to monitor loading progress
 				void connectToLoadingProgress(modelId, ctx, loader);
 			}
 
 			const response = await fetch(propsUrl, { signal: propsAbortController.signal });
 			if (!response.ok) {
-				// 500 during autoload is expected when the server cancels a load to start
-				// another model. Suppress the notification for that case.
 				if (!(shouldAutoload && response.status === 500)) {
 					ctx?.ui.notify(`[llama-cpp] /props for ${modelId} returned ${response.status}`, "error");
 				}
@@ -761,8 +742,6 @@ export default async function (pi: ExtensionAPI) {
 			});
 		} catch (error) {
 			const err = error as Error;
-			// Suppress notification for aborted requests (model was switched) and for a
-			// stale ctx (session was replaced while awaiting) — both are expected.
 			if (err.name !== "AbortError" && !isStaleContextError(err)) {
 				ctx?.ui.notify(`[llama-cpp] /props for ${modelId} failed: ${err.message}`, "error");
 			}
@@ -770,7 +749,6 @@ export default async function (pi: ExtensionAPI) {
 			clearTimeout(timer);
 			pendingMetadata.delete(modelId);
 			propsAbortController = null;
-			// Stop SSE connection when done
 			if (sseAbortController) {
 				sseAbortController.abort();
 				sseAbortController = null;
@@ -779,9 +757,6 @@ export default async function (pi: ExtensionAPI) {
 	}
 
 	await refreshProvider();
-
-	// Discover slots from the running server
-	await discoverSlots();
 
 	pi.on("input", async (event) => {
 		const trimmed = event.text.trim().toLowerCase();
@@ -795,45 +770,9 @@ export default async function (pi: ExtensionAPI) {
 		if (event.model.provider !== PROVIDER_ID) {
 			return;
 		}
-
-		void (async () => {
-			// ── Slot save/restore ──────────────────────────────────────────
-			const prevModelName = event.previousModel?.id;
-			const prevSlotId = prevModelName ? slotIdByModel.get(prevModelName) ?? null : null;
-
-			// Save the previous model's slot before switching away
-			if (prevSlotId !== null) {
-				persistSlotCheckpoint(prevModelName, prevSlotId);
-				await saveSlot(prevSlotId);
-			}
-
-			// Discover slots for the new model
-			const newSlotId = slotIdByModel.get(event.model.id);
-			if (newSlotId !== undefined) {
-				activeModelName = event.model.id;
-				currentSlotId = newSlotId;
-			}
-
-			// Try to restore a checkpoint for the new model
-			const checkpoint = findSlotCheckpoint(event.model.id);
-			if (checkpoint && checkpoint.slotId !== undefined) {
-				await restoreSlot(checkpoint.slotId, checkpoint.filename);
-				currentSlotId = checkpoint.slotId;
-				slotIdByModel.set(event.model.id, checkpoint.slotId);
-			}
-			// ────────────────────────────────────────────────────────────────
-
-			void discoverModelMetadata(
-				event.model.id,
-				ctx,
-				true,
-				PROPS_TIMEOUT_MS,
-				event.model,
-			);
-		})();
+		void discoverModelMetadata(event.model.id, ctx, true, PROPS_TIMEOUT_MS, event.model);
 	});
 
-	// Discover /props for already-active models because re-selecting them does not emit model_select.
 	pi.on("before_provider_request", (event, ctx) => {
 		try {
 			const modelId = (event.payload as { model?: unknown })?.model;
@@ -843,97 +782,22 @@ export default async function (pi: ExtensionAPI) {
 				void discoverModelMetadata(modelId, ctx, true, PROPS_TIMEOUT_MS, activeModel);
 			}
 		} catch (error) {
-			// Session was replaced as the request fired; nothing to discover.
 			if (!isStaleContextError(error)) {
 				throw error;
 			}
 		}
-	});
 
-	// ── Session events for slot save/restore ────────────────────────────
+		// Inject slot_id into the request payload if we have one
+		const payload = event.payload as { [key: string]: unknown } | undefined;
+		if (payload && typeof payload === "object" && currentSlotId !== null) {
+			(payload as Record<string, unknown>).slot_id = currentSlotId;
+		}
+	});
 
 	pi.on("session_start", async (event, ctx) => {
-		lastSessionFile = ctx.sessionManager.getSessionFile();
+		currentSessionFile = ctx.sessionManager.getSessionFile();
 
-		// Discover slots on every session start (startup, resume, fork)
+		// Discover slots on every session start
 		await discoverSlots();
-
-		// On resume/fork, try to restore the previous session's slot
-		if (event.reason === "resume" || event.reason === "fork") {
-			const checkpoint = slotCheckpoints.find(
-				(c) => c.sessionId === event.previousSessionFile,
-			);
-			if (checkpoint) {
-				try {
-					activeModelName = checkpoint.modelName;
-					await restoreSlot(checkpoint.slotId, checkpoint.filename);
-					currentSlotId = checkpoint.slotId;
-					slotIdByModel.set(checkpoint.modelName, checkpoint.slotId);
-					const modelName = checkpoint.modelName.split("/").pop() || checkpoint.modelName;
-					ctx.ui.notify(
-						`[llama-cpp] Restored KV cache for ${modelName}`,
-						"info",
-					);
-				} catch {
-					// Restore failed; will use fresh cache
-				}
-			}
-		}
-
-		// Clean up stale checkpoints (from sessions that no longer exist)
-		slotCheckpoints = slotCheckpoints.filter((c) => {
-			return lastSessionFile === "" || lastSessionFile === undefined || c.sessionId === "" || c.sessionId === lastSessionFile;
-		});
 	});
-
-	pi.on("session_shutdown", async () => {
-		clearFooterStatusTimeout();
-		// Stop in-flight /props and SSE so they don't resume against a stale ctx.
-		propsAbortController?.abort();
-		sseAbortController?.abort();
-
-		// Save the current model's slot before shutdown
-		// Use currentlyLoadedModel (tracked via SSE/props) as it's always set
-		if (currentSlotId !== null && currentlyLoadedModel) {
-			persistSlotCheckpoint(currentlyLoadedModel, currentSlotId);
-			await saveSlot(currentSlotId);
-		}
-
-		// Persist checkpoint data to session file for cross-session survival
-		try {
-			pi.appendEntry("llama-cpp-slot", {
-				type: "slot_checkpoints",
-				checkpoints: slotCheckpoints.map((c) => ({
-					slotId: c.slotId,
-					modelName: c.modelName,
-					modelProvider: c.modelProvider,
-					filename: c.filename,
-					timestamp: c.timestamp,
-				})),
-			});
-		} catch {
-			// Ignore persist errors
-		}
-	});
-
-	// Catch process termination (Ctrl-D / container exit) to save slots
-	// These events fire before the process exits, even when pi doesn't
-	// explicitly emit session_shutdown.
-	const saveOnExit = () => {
-		if (currentSlotId !== null && currentlyLoadedModel) {
-			persistSlotCheckpoint(currentlyLoadedModel, currentSlotId);
-			saveSlot(currentSlotId);
-		}
-	};
-	process.on("SIGTERM", saveOnExit);
-	process.on("SIGINT", saveOnExit);
-
-	// Also save on process exit as a last resort (sync, no awaits)
-	process.on("exit", () => {
-		if (currentSlotId !== null && currentlyLoadedModel) {
-			persistSlotCheckpoint(currentlyLoadedModel, currentSlotId);
-			saveSlot(currentSlotId);
-		}
-	});
-	// ─────────────────────────────────────────────────────────────────────
 }
