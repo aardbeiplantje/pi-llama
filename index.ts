@@ -855,6 +855,9 @@ export default async function (pi: ExtensionAPI) {
 	pi.on("session_start", async (event, ctx) => {
 		lastSessionFile = ctx.sessionManager.getSessionFile();
 
+		// Discover slots on every session start (startup, resume, fork)
+		await discoverSlots();
+
 		// On resume/fork, try to restore the previous session's slot
 		if (event.reason === "resume" || event.reason === "fork") {
 			const checkpoint = slotCheckpoints.find(
@@ -877,11 +880,6 @@ export default async function (pi: ExtensionAPI) {
 			}
 		}
 
-		// On startup, discover slots
-		if (event.reason === "startup") {
-			await discoverSlots();
-		}
-
 		// Clean up stale checkpoints (from sessions that no longer exist)
 		slotCheckpoints = slotCheckpoints.filter((c) => {
 			return lastSessionFile === "" || lastSessionFile === undefined || c.sessionId === "" || c.sessionId === lastSessionFile;
@@ -895,8 +893,9 @@ export default async function (pi: ExtensionAPI) {
 		sseAbortController?.abort();
 
 		// Save the current model's slot before shutdown
-		if (currentSlotId !== null && activeModelName) {
-			persistSlotCheckpoint(activeModelName, currentSlotId);
+		// Use currentlyLoadedModel (tracked via SSE/props) as it's always set
+		if (currentSlotId !== null && currentlyLoadedModel) {
+			persistSlotCheckpoint(currentlyLoadedModel, currentSlotId);
 			await saveSlot(currentSlotId);
 		}
 
