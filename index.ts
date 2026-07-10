@@ -58,20 +58,22 @@ async function saveSlot(slotId: number): Promise<boolean> {
 	const slotName = activeModelName.split("/").join("_").replace(/[^a-zA-Z0-9_]/g, "_");
 	const filename = `${slotName}_${slotId}.kv`;
 	const body: SlotSaveRequestBody = { filename, model: activeModelName };
+	console.log(`[llama-cpp] saveSlot(${slotId}): url=${serverUrl}/slots/${slotId}?action=save body=${JSON.stringify(body)}`);
 	try {
 		const res = await fetch(`${serverUrl}/slots/${slotId}?action=save`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(body),
 		});
+		const resText = await res.text();
 		if (!res.ok) {
-			const errText = await res.text();
 			// First failure marks slot save as unsupported to avoid repeated noisy errors
 			if (slotSaveSupported === null) {
 				slotSaveSupported = false;
+				console.warn(`[llama-cpp] saveSlot(${slotId}) ${res.status}: ${resText}`);
 				console.warn(`[llama-cpp] slot save/restore not supported — server may need --slot-save-path`);
 			} else {
-				console.warn(`[llama-cpp] saveSlot(${slotId}) ${res.status}: ${errText}`);
+				console.warn(`[llama-cpp] saveSlot(${slotId}) ${res.status}: ${resText}`);
 			}
 			return false;
 		}
@@ -79,7 +81,7 @@ async function saveSlot(slotId: number): Promise<boolean> {
 		if (slotSaveSupported === null) {
 			slotSaveSupported = true;
 		}
-		const result = await res.json();
+		const result = JSON.parse(resText);
 		const nWritten = (result as { n_written?: number })?.n_written;
 		console.log(`[llama-cpp] slot ${slotId} saved ${nWritten ?? "??"} tokens to ${filename}`);
 		return true;
@@ -87,7 +89,7 @@ async function saveSlot(slotId: number): Promise<boolean> {
 		// Connection errors also indicate slot saving is not supported
 		if (slotSaveSupported === null) {
 			slotSaveSupported = false;
-			console.warn(`[llama-cpp] slot save/restore not supported — server may need --slot-save-path`);
+			console.warn(`[llama-cpp] saveSlot(${slotId}) failed: ${(error as Error).message}`);
 		}
 		console.warn(`[llama-cpp] saveSlot(${slotId}) failed: ${(error as Error).message}`);
 		return false;
@@ -124,18 +126,28 @@ async function restoreSlot(slotId: number, filename: string): Promise<boolean> {
 
 async function discoverSlots(): Promise<void> {
 	try {
-		const res = await fetch(`${_baseUrl}/models`);
-		if (!res.ok) return;
+		const modelsUrl = `${_baseUrl}/models`;
+		console.log(`[llama-cpp] discoverSlots: modelsUrl=${modelsUrl}`);
+		const res = await fetch(modelsUrl);
+		if (!res.ok) {
+			console.warn(`[llama-cpp] discoverSlots: /models returned ${res.status}`);
+			return;
+		}
 		const payload = await res.json();
-		if (!payload.data) return;
-
+		if (!payload.data) {
+			console.warn(`[llama-cpp] discoverSlots: no data in /models response`);
+			return;
+		}
 		// Find currently loaded model name(s)
 		for (const model of payload.data as Array<{ id: string; status?: { value?: string } }>) {
 			if (model.status?.value === "loaded") {
 				activeModelName = model.id;
 			}
 		}
-		if (!activeModelName) return;
+		if (!activeModelName) {
+			console.warn(`[llama-cpp] discoverSlots: no loaded model found (ids: ${(payload.data as any[]).map((m: any) => m.id).join(", ")})`);
+			return;
+		}
 
 		// Query /slots endpoint to get numeric slot IDs
 		const slotsRes = await fetch(
