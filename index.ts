@@ -46,6 +46,9 @@ let activeModelName: string | null = null;
 let slotPersistFn: ((customType: string, data?: unknown) => void) | null = null;
 let _baseUrl: string = DEFAULT_BASE_URL;
 
+// Track whether slot save/restore is supported (set by saveSlot on first call)
+let slotSaveSupported: boolean | null = null;
+
 async function saveSlot(slotId: number): Promise<boolean> {
 	const serverUrl = _baseUrl.replace(/\/v1$/, "");
 	if (!activeModelName) {
@@ -63,14 +66,29 @@ async function saveSlot(slotId: number): Promise<boolean> {
 		});
 		if (!res.ok) {
 			const errText = await res.text();
-			console.warn(`[llama-cpp] saveSlot(${slotId}) ${res.status}: ${errText}`);
+			// First failure marks slot save as unsupported to avoid repeated noisy errors
+			if (slotSaveSupported === null) {
+				slotSaveSupported = false;
+				console.warn(`[llama-cpp] slot save/restore not supported — server may need --slot-save-path`);
+			} else {
+				console.warn(`[llama-cpp] saveSlot(${slotId}) ${res.status}: ${errText}`);
+			}
 			return false;
+		}
+		// First successful save marks slot support as enabled
+		if (slotSaveSupported === null) {
+			slotSaveSupported = true;
 		}
 		const result = await res.json();
 		const nWritten = (result as { n_written?: number })?.n_written;
 		console.log(`[llama-cpp] slot ${slotId} saved ${nWritten ?? "??"} tokens to ${filename}`);
 		return true;
 	} catch (error) {
+		// Connection errors also indicate slot saving is not supported
+		if (slotSaveSupported === null) {
+			slotSaveSupported = false;
+			console.warn(`[llama-cpp] slot save/restore not supported — server may need --slot-save-path`);
+		}
 		console.warn(`[llama-cpp] saveSlot(${slotId}) failed: ${(error as Error).message}`);
 		return false;
 	}
@@ -152,6 +170,15 @@ function persistSlotCheckpointToSession(slotId: number, modelName: string): void
 	} catch {
 		// Ignore persist errors
 	}
+}
+
+// Attempt to restore from a saved checkpoint. Returns false if slot saving
+// is not supported by the llama.cpp server, to avoid breaking the flow.
+async function restoreCheckpoint(slotId: number, modelName: string, filename: string): Promise<boolean> {
+	if (slotSaveSupported === false) {
+		return false;
+	}
+	return restoreSlot(slotId, filename);
 }
 
 // ---------------------------------------------------------------------------
@@ -338,7 +365,13 @@ export default async function (pi: ExtensionAPI) {
 							"success",
 						);
 					} else {
-						ctx.ui.notify(`[llama-cpp] Failed to save slot ${currentSlotId}`, "error");
+						const hint = slotSaveSupported === false
+							? " Server may be missing --slot-save-path."
+							: "";
+						ctx.ui.notify(
+							`[llama-cpp] Failed to save slot ${currentSlotId}.${hint}`,
+							"error",
+						);
 					}
 					break;
 				}
@@ -373,7 +406,13 @@ export default async function (pi: ExtensionAPI) {
 							"success",
 						);
 					} else {
-						ctx.ui.notify(`[llama-cpp] Failed to restore slot ${slotId}`, "error");
+						const hint = slotSaveSupported === false
+						? " Server may be missing --slot-save-path."
+						: "";
+					ctx.ui.notify(
+						`[llama-cpp] Failed to restore slot ${slotId}.${hint}`,
+						"error",
+					);
 					}
 					break;
 				}
@@ -760,6 +799,92 @@ export default async function (pi: ExtensionAPI) {
 
 	await refreshProvider();
 
+	// -----------------------------------------------------------------------
+	// Auto-save / auto-restore event handlers (fail-safe: no-op if slots unsupported)
+	// -----------------------------------------------------------------------
+
+	// Save active slot before session shutdown
+	const saveActiveSlot = async (): Promise<void> => {
+		if (currentSlotId === null || activeModelName === null || slotSaveSupported === false) {
+			return;
+		}
+		try {
+			const ok = await saveSlot(currentSlotId);
+			if (ok) {
+				persistSlotCheckpointToSession(currentSlotId, activeModelName);
+			}
+		} catch {
+			// Non-fatal — slot saving is best-effort
+		}
+	};
+
+	// Try to restore slot on session start (resume from previous session)
+	const restoreActiveSlot = async (): Promise<void> => {
+		if (currentSlotId === null || activeModelName === null || slotSaveSupported === false) {
+			return;
+		}
+		try {
+			const slotName = activeModelName.split("/").join("_").replace(/[^a-zA-Z0-9_]/g, "_");
+			const filename = `${slotName}_${currentSlotId}.kv`;
+			const ok = await restoreSlot(currentSlotId, filename);
+			if (ok) {
+				console.log(`[llama-cpp] auto-restored slot ${currentSlotId} from ${filename}`);
+			}
+		} catch {
+			// Non-fatal — slot restore is best-effort
+		}
+	};
+
+	// Save slot on model switch (save old model, try restore new model)
+	const switchModelAndSlots = async (modelId: string, ctx?: ExtensionCtx): Promise<void> => {
+		if (slotSaveSupported === false || currentSlotId === null || activeModelName === null) {
+			return;
+		}
+		try {
+			// Save the previous model's slot before switching
+			await saveSlot(currentSlotId);
+			persistSlotCheckpointToSession(currentSlotId, activeModelName);
+		} catch {
+			// Non-fatal
+		}
+
+		// After the new model loads, try to restore its checkpoint
+		setTimeout(async () => {
+			if (slotSaveSupported === false || currentSlotId === null || activeModelName === null) {
+				return;
+			}
+			try {
+				const slotName = activeModelName.split("/").join("_").replace(/[^a-zA-Z0-9_]/g, "_");
+				const filename = `${slotName}_${currentSlotId}.kv`;
+				const ok = await restoreSlot(currentSlotId, filename);
+				if (ok) {
+					console.log(`[llama-cpp] model_select auto-restored slot ${currentSlotId} from ${filename}`);
+				}
+			} catch {
+				// Non-fatal
+			}
+		}, 2000); // Wait for model autoload
+	};
+
+	pi.on("session_shutdown", async (event, ctx) => {
+		await saveActiveSlot();
+	});
+
+	pi.on("session_start", async (event, ctx) => {
+		currentSessionFile = ctx.sessionManager.getSessionFile();
+		await discoverSlots();
+		await restoreActiveSlot();
+	});
+
+	pi.on("model_select", async (event, ctx) => {
+		if (event.model.provider !== PROVIDER_ID) {
+			return;
+		}
+		void discoverModelMetadata(event.model.id, ctx, true, PROPS_TIMEOUT_MS, event.model);
+		discoverSlotForModel(event.model.id, ctx);
+		void switchModelAndSlots(event.model.id, ctx);
+	});
+
 	pi.on("input", async (event) => {
 		const trimmed = event.text.trim().toLowerCase();
 		if (trimmed === "/model") {
@@ -815,13 +940,7 @@ export default async function (pi: ExtensionAPI) {
 		})();
 	}
 
-	pi.on("model_select", (event, ctx) => {
-		if (event.model.provider !== PROVIDER_ID) {
-			return;
-		}
-		void discoverModelMetadata(event.model.id, ctx, true, PROPS_TIMEOUT_MS, event.model);
-		discoverSlotForModel(event.model.id, ctx);
-	});
+
 
 	pi.on("before_provider_request", (event, ctx) => {
 		try {
@@ -846,8 +965,5 @@ export default async function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (event, ctx) => {
 		currentSessionFile = ctx.sessionManager.getSessionFile();
-
-		// Discover slots on every session start
-		await discoverSlots();
 	});
 }
