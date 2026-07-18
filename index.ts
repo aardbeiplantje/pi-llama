@@ -84,8 +84,11 @@ function allocateSlot(pool: SlotPool, agentId: string): number {
 
 /** Release a slot back to the pool. */
 function releaseSlot(pool: SlotPool, agentId: string): void {
-	pool.allocated.delete(agentId);
-	pool.allocated.delete(String(pool.allocated.get(agentId)));
+	const slot = pool.allocated.get(agentId);
+	if (slot !== undefined) {
+		pool.allocated.delete(agentId);
+		pool.allocated.delete(String(slot));
+	}
 }
 
 const ModelsResponseSchema = Type.Object({
