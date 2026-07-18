@@ -21,6 +21,8 @@ const DEFAULT_CONTEXT_WINDOW = 8192;
 // maxTokens (see model-registry.ts parseModels).
 const DEFAULT_MAX_TOKENS = 16384;
 const PROPS_TIMEOUT_MS = 120_000;
+// Default slot ID for llama.cpp — can be overridden via LLAMA_SLOT_ID env var.
+const DEFAULT_SLOT_ID = 0;
 
 const ModelsResponseSchema = Type.Object({
 	data: Type.Optional(
@@ -170,6 +172,25 @@ export default async function (pi: ExtensionAPI) {
 
 	const baseUrl = (process.env.LLAMA_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
 	const apiKey = process.env.LLAMA_API_KEY ?? "no-key";
+
+	// Resolve slot ID from environment variable (default: 0).
+	const slotId = (() => {
+		const envVal = process.env.LLAMA_SLOT_ID;
+		if (envVal !== undefined && envVal !== "") {
+			const parsed = parseInt(envVal, 10);
+			if (!isNaN(parsed) && parsed >= 0) {
+				return parsed;
+			}
+			console.warn(`[llama-cpp] invalid LLAMA_SLOT_ID="${envVal}", falling back to default ${DEFAULT_SLOT_ID}`);
+		}
+		return DEFAULT_SLOT_ID;
+	})();
+
+	if (slotId !== DEFAULT_SLOT_ID) {
+		console.log(`[llama-cpp] using slot_id=${slotId} (from LLAMA_SLOT_ID env var)`);
+	} else {
+		console.log(`[llama-cpp] using default slot_id=${DEFAULT_SLOT_ID}`);
+	}
 
 	async function refreshProvider(): Promise<void> {
 		try {
@@ -568,6 +589,7 @@ export default async function (pi: ExtensionAPI) {
 	});
 
 	// Discover /props for already-active models because re-selecting them does not emit model_select.
+	// Inject slot_id into every provider request so llama.cpp reuses the same KV cache slot.
 	pi.on("before_provider_request", (event, ctx) => {
 		try {
 			const modelId = (event.payload as { model?: unknown })?.model;
@@ -581,6 +603,12 @@ export default async function (pi: ExtensionAPI) {
 			if (!isStaleContextError(error)) {
 				throw error;
 			}
+		}
+
+		// Inject slot_id into the request payload
+		const payload = event.payload as { [key: string]: unknown } | undefined;
+		if (payload && typeof payload === "object") {
+			(payload as Record<string, unknown>).slot_id = slotId;
 		}
 	});
 
