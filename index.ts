@@ -24,6 +24,70 @@ const PROPS_TIMEOUT_MS = 120_000;
 // Default slot ID for llama.cpp — can be overridden via LLAMA_SLOT_ID env var.
 const DEFAULT_SLOT_ID = 0;
 
+// ---------------------------------------------------------------------------
+// Slot pool allocator — parses LLAMA_SLOT_ID as a range (e.g. "0-3") and
+// auto-assigns slots from the pool. Sub-agents get their own slot so the
+// main agent's KV cache is never evicted.
+// ---------------------------------------------------------------------------
+
+interface SlotPool {
+	slots: number[];
+	allocated: Map<string, number>; // agentId → slot
+	nextIndex: number;
+}
+
+/** Parse "0-3" → [0,1,2,3], "0" → [0], invalid → [0]. */
+function parseSlotRange(raw: string | undefined): number[] {
+	if (!raw || raw.trim() === "") return [DEFAULT_SLOT_ID];
+	const trimmed = raw.trim();
+	// Range format: "0-3"
+	const rangeMatch = trimmed.match(/^(\d+)\s*-\s*(\d+)$/);
+	if (rangeMatch) {
+		const start = parseInt(rangeMatch[1], 10);
+		const end = parseInt(rangeMatch[2], 10);
+		if (start <= end && end < 100) {
+			const slots: number[] = [];
+			for (let i = start; i <= end; i++) slots.push(i);
+			return slots;
+		}
+	}
+	// Single value
+	const parsed = parseInt(trimmed, 10);
+	if (!isNaN(parsed) && parsed >= 0) return [parsed];
+	// Fallback
+	console.warn(`[llama-cpp] invalid LLAMA_SLOT_ID="${raw}", using default [${DEFAULT_SLOT_ID}]`);
+	return [DEFAULT_SLOT_ID];
+}
+
+function createSlotPool(slots: number[]): SlotPool {
+	return { slots, allocated: new Map(), nextIndex: 0 };
+}
+
+/** Get next available slot from pool, wrapping around. */
+function allocateSlot(pool: SlotPool, agentId: string): number {
+	if (pool.allocated.has(agentId)) return pool.allocated.get(agentId)!;
+	// Find first unallocated slot
+	for (let i = 0; i < pool.slots.length; i++) {
+		const slot = pool.slots[(pool.nextIndex + i) % pool.slots.length];
+		if (!pool.allocated.has(String(slot))) {
+			pool.allocated.set(agentId, slot);
+			pool.allocated.set(String(slot), slot); // track by slot value too
+			pool.nextIndex = (i + 1) % pool.slots.length;
+			return slot;
+		}
+	}
+	// All slots allocated — reuse first slot (shouldn't happen with maxConcurrent=1)
+	const firstSlot = pool.slots[0];
+	pool.allocated.set(agentId, firstSlot);
+	return firstSlot;
+}
+
+/** Release a slot back to the pool. */
+function releaseSlot(pool: SlotPool, agentId: string): void {
+	pool.allocated.delete(agentId);
+	pool.allocated.delete(String(pool.allocated.get(agentId)));
+}
+
 const ModelsResponseSchema = Type.Object({
 	data: Type.Optional(
 		Type.Array(
@@ -173,24 +237,14 @@ export default async function (pi: ExtensionAPI) {
 	const baseUrl = (process.env.LLAMA_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
 	const apiKey = process.env.LLAMA_API_KEY ?? "no-key";
 
-	// Resolve slot ID from environment variable (default: 0).
-	const slotId = (() => {
-		const envVal = process.env.LLAMA_SLOT_ID;
-		if (envVal !== undefined && envVal !== "") {
-			const parsed = parseInt(envVal, 10);
-			if (!isNaN(parsed) && parsed >= 0) {
-				return parsed;
-			}
-			console.warn(`[llama-cpp] invalid LLAMA_SLOT_ID="${envVal}", falling back to default ${DEFAULT_SLOT_ID}`);
-		}
-		return DEFAULT_SLOT_ID;
-	})();
+	// -----------------------------------------------------------------------
+	// Slot pool — parse LLAMA_SLOT_ID as a range and auto-assign slots
+	// -----------------------------------------------------------------------
+	const slotPool = createSlotPool(parseSlotRange(process.env.LLAMA_SLOT_ID));
+	const mainAgentId = "main";
+	let currentSlotId = allocateSlot(slotPool, mainAgentId);
 
-	if (slotId !== DEFAULT_SLOT_ID) {
-		console.log(`[llama-cpp] using slot_id=${slotId} (from LLAMA_SLOT_ID env var)`);
-	} else {
-		console.log(`[llama-cpp] using default slot_id=${DEFAULT_SLOT_ID}`);
-	}
+	console.log(`[llama-cpp] slot pool: [${slotPool.slots.join(",")}] → main agent uses slot ${currentSlotId}`);
 
 	async function refreshProvider(): Promise<void> {
 		try {
@@ -588,6 +642,32 @@ export default async function (pi: ExtensionAPI) {
 		void discoverModelMetadata(event.model.id, ctx, true, PROPS_TIMEOUT_MS, event.model);
 	});
 
+	// -----------------------------------------------------------------------
+	// Sub-agent slot tracking via pi.events
+	// -----------------------------------------------------------------------
+	// Sub-agents emit events that we listen to for slot assignment/release.
+	const subAgentSlots = new Map<string, number>(); // agentId → slot
+
+	// Listen for sub-agent lifecycle events from pi-subagents extension
+	pi.on("subagents:started", (event: { agentId: string; slotId?: number }) => {
+		const agentId = event.agentId;
+		if (event.slotId !== undefined) {
+			subAgentSlots.set(agentId, event.slotId);
+			console.log(`[llama-cpp] sub-agent ${agentId} assigned slot ${event.slotId}`);
+		} else {
+			// Auto-assign from pool
+			const slot = allocateSlot(slotPool, agentId);
+			subAgentSlots.set(agentId, slot);
+			console.log(`[llama-cpp] sub-agent ${agentId} auto-assigned slot ${slot}`);
+		}
+	});
+
+	pi.on("subagents:completed", (event: { agentId: string }) => {
+		const agentId = event.agentId;
+		subAgentSlots.delete(agentId);
+		console.log(`[llama-cpp] sub-agent ${agentId} completed, slot released`);
+	});
+
 	// Discover /props for already-active models because re-selecting them does not emit model_select.
 	// Inject slot_id into every provider request so llama.cpp reuses the same KV cache slot.
 	pi.on("before_provider_request", (event, ctx) => {
@@ -605,10 +685,28 @@ export default async function (pi: ExtensionAPI) {
 			}
 		}
 
+		// Determine which slot to use: sub-agent slot if available, otherwise main agent slot
+		let requestSlotId = currentSlotId;
+		// Check if we can identify the current agent from the session context
+		// Sub-agent sessions have names like "Explore#a1b2c3d4"
+		try {
+			const sessionName = ctx.sessionManager?.getSessionName?.() ?? "";
+			if (sessionName && sessionName.includes("#")) {
+				// Extract agent ID from session name (format: "Type#agentId")
+				const parts = sessionName.split("#");
+				const agentId = parts.length > 1 ? parts[1] : sessionName;
+				if (subAgentSlots.has(agentId)) {
+					requestSlotId = subAgentSlots.get(agentId)!;
+				}
+			}
+		} catch {
+			// Session name access failed — use main agent slot
+		}
+
 		// Inject slot_id into the request payload
 		const payload = event.payload as { [key: string]: unknown } | undefined;
 		if (payload && typeof payload === "object") {
-			(payload as Record<string, unknown>).slot_id = slotId;
+			(payload as Record<string, unknown>).slot_id = requestSlotId;
 		}
 	});
 
