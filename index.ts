@@ -694,15 +694,18 @@ export default async function (pi: ExtensionAPI) {
 		// Sub-agent sessions have names like "Explore#a1b2c3d4"
 		try {
 			const sessionName = ctx.sessionManager?.getSessionName?.() ?? "";
+			console.log(`[llama-cpp] before_provider_request: sessionName="${sessionName}" currentSlotId=${currentSlotId}`);
 			if (sessionName && sessionName.includes("#")) {
 				// Extract agent ID from session name (format: "Type#agentId")
 				const parts = sessionName.split("#");
 				const agentId = parts.length > 1 ? parts[1] : sessionName;
 				if (subAgentSlots.has(agentId)) {
 					requestSlotId = subAgentSlots.get(agentId)!;
+					console.log(`[llama-cpp] sub-agent ${agentId} using slot ${requestSlotId}`);
 				}
 			}
-		} catch {
+		} catch (err) {
+			console.log(`[llama-cpp] session name access failed: ${(err as Error).message}`);
 			// Session name access failed — use main agent slot
 		}
 
@@ -710,6 +713,9 @@ export default async function (pi: ExtensionAPI) {
 		const payload = event.payload as { [key: string]: unknown } | undefined;
 		if (payload && typeof payload === "object") {
 			(payload as Record<string, unknown>).slot_id = requestSlotId;
+			console.log(`[llama-cpp] injected slot_id=${requestSlotId} into request`);
+		} else {
+			console.log(`[llama-cpp] WARNING: payload is null/undefined, slot_id NOT injected`);
 		}
 	});
 
