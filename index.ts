@@ -694,7 +694,7 @@ export default async function (pi: ExtensionAPI) {
 			if (typeof modelId === "string") {
 				const activeModel =
 					ctx.model?.provider === PROVIDER_ID && ctx.model.id === modelId ? ctx.model : undefined;
-				void discoverModelMetadata(modelId, ctx, true, PROPS_TIMEOUT_MS, activeModel);
+				void discoverModelMetadata(modelId, ctx, false, PROPS_TIMEOUT_MS, activeModel);
 			}
 		} catch (error) {
 			// Session was replaced as the request fired; nothing to discover.
