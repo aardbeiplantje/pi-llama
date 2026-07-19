@@ -242,12 +242,19 @@ export default async function (pi: ExtensionAPI) {
 
 	// -----------------------------------------------------------------------
 	// Slot pool — parse LLAMA_SLOT_ID as a range and auto-assign slots
+	// Slot 0 is reserved for the main agent. Sub-agents get other slots.
+	// If only 1 slot is available (e.g. LLAMA_SLOT_ID=0 or LLAMA_SLOT_ID=3),
+	// it's shared and llama.cpp will do prompt prefill.
 	// -----------------------------------------------------------------------
-	const slotPool = createSlotPool(parseSlotRange(process.env.LLAMA_SLOT_ID));
+	const allSlots = parseSlotRange(process.env.LLAMA_SLOT_ID);
 	const mainAgentId = "main";
-	let currentSlotId = allocateSlot(slotPool, mainAgentId);
+	// Reserve slot 0 for main agent; sub-agents get remaining slots
+	const mainAgentSlot = 0;
+	const subAgentSlots = allSlots.filter(s => s !== mainAgentSlot);
+	const slotPool = createSlotPool(subAgentSlots);
+	let currentSlotId = mainAgentSlot;
 
-	console.log(`[llama-cpp] slot pool: [${slotPool.slots.join(",")}] → main agent uses slot ${currentSlotId}`);
+	console.log(`[llama-cpp] slot pool: [${allSlots.join(",")}] → main agent uses slot ${mainAgentSlot}, sub-agents use [${subAgentSlots.join(",") || "none"}]`);
 
 	async function refreshProvider(): Promise<void> {
 		try {
