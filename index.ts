@@ -729,6 +729,17 @@ export default async function (pi: ExtensionAPI) {
 		if (payload && typeof payload === "object") {
 			(payload as Record<string, unknown>).id_slot = requestSlotId;
 			console.log(`[llama-cpp] injected id_slot=${requestSlotId} into request`);
+
+			// Sanitize messages: map "developer" role to "system" (llama.cpp compatibility)
+			if (Array.isArray((payload as Record<string, unknown>).messages)) {
+				(payload as Record<string, unknown>).messages = (payload as Record<string, unknown>).messages.map(
+					(msg: unknown) =>
+						typeof msg === "object" && msg !== null && "role" in msg
+							? { ...msg, role: (msg as { role: string }).role === "developer" ? "system" : (msg as { role: string }).role }
+							: msg,
+				);
+				console.log(`[llama-cpp] sanitized messages: developer → system`);
+			}
 		} else {
 			console.log(`[llama-cpp] WARNING: payload is null/undefined, id_slot NOT injected`);
 		}
