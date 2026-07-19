@@ -250,11 +250,11 @@ export default async function (pi: ExtensionAPI) {
 	const mainAgentId = "main";
 	// Reserve slot 0 for main agent; sub-agents get remaining slots
 	const mainAgentSlot = 0;
-	const subAgentSlots = allSlots.filter(s => s !== mainAgentSlot);
-	const slotPool = createSlotPool(subAgentSlots);
+	const sas = allSlots.filter(s => s !== mainAgentSlot);
+	const slotPool = createSlotPool(sas);
 	let currentSlotId = mainAgentSlot;
 
-	console.log(`[llama-cpp] slot pool: [${allSlots.join(",")}] → main agent uses slot ${mainAgentSlot}, sub-agents use [${subAgentSlots.join(",") || "none"}]`);
+	console.log(`[llama-cpp] slot pool: [${allSlots.join(",")}] → main agent uses slot ${mainAgentSlot}, sub-agents use [${sas.join(",") || "none"}]`);
 
 	async function refreshProvider(): Promise<void> {
 		try {
@@ -656,25 +656,25 @@ export default async function (pi: ExtensionAPI) {
 	// Sub-agent slot tracking via pi.events
 	// -----------------------------------------------------------------------
 	// Sub-agents emit events that we listen to for slot assignment/release.
-	const subAgentSlots = new Map<string, number>(); // agentId → slot
+	const ssubAgentSlots = new Map<string, number>(); // agentId → slot
 
 	// Listen for sub-agent lifecycle events from pi-subagents extension
 	pi.on("subagents:started", (event: { agentId: string; slotId?: number }) => {
 		const agentId = event.agentId;
 		if (event.slotId !== undefined) {
-			subAgentSlots.set(agentId, event.slotId);
+			ssubAgentSlots.set(agentId, event.slotId);
 			console.log(`[llama-cpp] sub-agent ${agentId} assigned slot ${event.slotId}`);
 		} else {
 			// Auto-assign from pool
 			const slot = allocateSlot(slotPool, agentId);
-			subAgentSlots.set(agentId, slot);
+			ssubAgentSlots.set(agentId, slot);
 			console.log(`[llama-cpp] sub-agent ${agentId} auto-assigned slot ${slot}`);
 		}
 	});
 
 	pi.on("subagents:completed", (event: { agentId: string }) => {
 		const agentId = event.agentId;
-		subAgentSlots.delete(agentId);
+		ssubAgentSlots.delete(agentId);
 		console.log(`[llama-cpp] sub-agent ${agentId} completed, slot released`);
 	});
 
@@ -706,8 +706,8 @@ export default async function (pi: ExtensionAPI) {
 				// Extract agent ID from session name (format: "Type#agentId")
 				const parts = sessionName.split("#");
 				const agentId = parts.length > 1 ? parts[1] : sessionName;
-				if (subAgentSlots.has(agentId)) {
-					requestSlotId = subAgentSlots.get(agentId)!;
+				if (ssubAgentSlots.has(agentId)) {
+					requestSlotId = ssubAgentSlots.get(agentId)!;
 					console.log(`[llama-cpp] sub-agent ${agentId} using slot ${requestSlotId}`);
 				}
 			}
