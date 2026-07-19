@@ -732,13 +732,29 @@ export default async function (pi: ExtensionAPI) {
 
 			// Sanitize messages: map "developer" role to "system" (llama.cpp compatibility)
 			if (Array.isArray((payload as Record<string, unknown>).messages)) {
-				(payload as Record<string, unknown>).messages = (payload as Record<string, unknown>).messages.map(
+				const messages = (payload as Record<string, unknown>).messages as unknown[];
+				const sanitized = messages.map(
 					(msg: unknown) =>
 						typeof msg === "object" && msg !== null && "role" in msg
 							? { ...msg, role: (msg as { role: string }).role === "developer" ? "system" : (msg as { role: string }).role }
 							: msg,
 				);
-				console.log(`[llama-cpp] sanitized messages: developer → system`);
+				// Ensure first message is "system" role
+				if (sanitized.length > 0) {
+					const firstMsg = sanitized[0];
+					if (typeof firstMsg === "object" && firstMsg !== null && "role" in firstMsg) {
+						const firstRole = (firstMsg as { role: string }).role;
+						if (firstRole !== "system") {
+							// If first message is not system, prepend a system message
+							const systemMsg = { role: "system", content: "You are a helpful assistant." };
+							sanitized.unshift(systemMsg);
+							console.log(`[llama-cpp] ensured first message is system role (was: ${firstRole})`);
+						} else {
+							console.log(`[llama-cpp] sanitized messages: developer → system, first message already system`);
+						}
+					}
+				}
+				(payload as Record<string, unknown>).messages = sanitized;
 			}
 		} else {
 			console.log(`[llama-cpp] WARNING: payload is null/undefined, id_slot NOT injected`);
