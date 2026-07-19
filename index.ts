@@ -242,14 +242,16 @@ export default async function (pi: ExtensionAPI) {
 
 	// -----------------------------------------------------------------------
 	// Slot pool — parse LLAMA_SLOT_ID as a range and auto-assign slots
-	// Slot 0 is reserved for the main agent. Sub-agents get other slots.
+	// Slot 0 is reserved for the main agent IF it's in the pool.
+	// Otherwise the main agent uses the first available slot.
+	// Sub-agents get other slots from the pool.
 	// If only 1 slot is available (e.g. LLAMA_SLOT_ID=0 or LLAMA_SLOT_ID=3),
 	// it's shared and llama.cpp will do prompt prefill.
 	// -----------------------------------------------------------------------
 	const allSlots = parseSlotRange(process.env.LLAMA_SLOT_ID);
 	const mainAgentId = "main";
-	// Reserve slot 0 for main agent; sub-agents get remaining slots
-	const mainAgentSlot = 0;
+	// Reserve slot 0 for main agent if present in the pool; otherwise use first slot
+	const mainAgentSlot = allSlots.includes(0) ? 0 : allSlots[0];
 	const sas = allSlots.filter(s => s !== mainAgentSlot);
 	const slotPool = createSlotPool(sas);
 	let currentSlotId = mainAgentSlot;
@@ -669,6 +671,12 @@ export default async function (pi: ExtensionAPI) {
 			const slot = allocateSlot(slotPool, agentId);
 			ssubAgentSlots.set(agentId, slot);
 			console.log(`[llama-cpp] sub-agent ${agentId} auto-assigned slot ${slot}`);
+		}
+		// Also store by short ID (first 8 chars) to match session name format
+		// used by agent-runner.ts: `${baseSessionName}#${agentId.slice(0, 8)}`
+		const shortId = agentId.slice(0, 8);
+		if (shortId !== agentId) {
+			ssubAgentSlots.set(shortId, ssubAgentSlots.get(agentId)!);
 		}
 	});
 
