@@ -709,13 +709,13 @@ export default async function (pi: ExtensionAPI) {
 			// Session name access failed — use main agent slot
 		}
 
-		// Inject slot_id into the request payload
+		// Inject id_slot into the request payload (llama.cpp expects "id_slot", not "slot_id")
 		const payload = event.payload as { [key: string]: unknown } | undefined;
 		if (payload && typeof payload === "object") {
-			(payload as Record<string, unknown>).slot_id = requestSlotId;
-			console.log(`[llama-cpp] injected slot_id=${requestSlotId} into request`);
+			(payload as Record<string, unknown>).id_slot = requestSlotId;
+			console.log(`[llama-cpp] injected id_slot=${requestSlotId} into request`);
 		} else {
-			console.log(`[llama-cpp] WARNING: payload is null/undefined, slot_id NOT injected`);
+			console.log(`[llama-cpp] WARNING: payload is null/undefined, id_slot NOT injected`);
 		}
 	});
 
