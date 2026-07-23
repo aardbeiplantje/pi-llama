@@ -1,8 +1,18 @@
 /**
- * llama.cpp provider for pi.
+ * llama.cpp / FastFlowLM provider for pi.
  *
- * Auto-discovers models from a running `llama-server` and
+ * Auto-discovers models from a running `llama-server` or `flm-server` and
  * registers them under the `llama-cpp` provider.
+ *
+ * Features:
+ * - llama.cpp: Full support with /props and /models/sse endpoints
+ * - FastFlowLM (AMD NPU): Compatible mode with graceful fallbacks
+ *
+ * Environment variables:
+ * - LLAMA_BASE_URL: Base URL for the server (default: http://localhost:8080/v1)
+ * - LLAMA_API_KEY: API key (default: no-key)
+ * - LLAMA_SLOT_ID: Slot ID or range (e.g., "0" or "0-3") for multi-slot inference
+ * - LLAMA_FLM_MODE: Set to "1" or "true" to force FastFlowLM compatibility mode
  *
  * Usage: `pi install github.com/huggingface/pi-llama`
  */
@@ -16,6 +26,8 @@ const PROVIDER_ID = "llama-cpp";
 const DEFAULT_BASE_URL = "http://localhost:8080/v1";
 // Fallback for /v1/models entries missing meta.n_ctx.
 const DEFAULT_CONTEXT_WINDOW = 8192;
+// FastFlowLM / AMD NPU fallback context (typically lower on NPU hardware).
+const FLM_DEFAULT_CONTEXT_WINDOW = 2048;
 // llama.cpp has no output-token cap (no endpoint reports one; generation is only
 // bounded by the context window), so use Pi's own default for models that omit
 // maxTokens (see model-registry.ts parseModels).
@@ -23,6 +35,11 @@ const DEFAULT_MAX_TOKENS = 16384;
 const PROPS_TIMEOUT_MS = 120_000;
 // Default slot ID for llama.cpp — can be overridden via LLAMA_SLOT_ID env var.
 const DEFAULT_SLOT_ID = 0;
+// Backend capability flags — detected at runtime.
+let supportsPropsEndpoint = true;
+let supportsSSEProgress = true;
+// FastFlowLM/AMD NPU mode — auto-detected or forced via LLAMA_FLM_MODE=1
+let flmMode = false;
 
 // ---------------------------------------------------------------------------
 // Slot pool allocator — parses LLAMA_SLOT_ID as a range (e.g. "0-3") and
@@ -239,6 +256,16 @@ export default async function (pi: ExtensionAPI) {
 
 	const baseUrl = (process.env.LLAMA_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
 	const apiKey = process.env.LLAMA_API_KEY ?? "no-key";
+	// Detect FastFlowLM mode — either forced via env var or auto-detected.
+	flmMode = process.env.LLAMA_FLM_MODE === "1" || process.env.LLAMA_FLM_MODE === "true";
+	if (flmMode) {
+		console.log(`[llama-cpp] FastFlowLM/AMD NPU mode enabled via LLAMA_FLM_MODE`);
+		supportsPropsEndpoint = false;
+		supportsSSEProgress = false;
+	} else {
+		// Auto-detect backend capabilities by probing endpoints.
+		await detectBackendCapabilities();
+	}
 
 	// -----------------------------------------------------------------------
 	// Slot pool — parse LLAMA_SLOT_ID as a range and auto-assign slots
@@ -257,6 +284,51 @@ export default async function (pi: ExtensionAPI) {
 	let currentSlotId = mainAgentSlot;
 
 	console.log(`[llama-cpp] slot pool: [${allSlots.join(",")}] → main agent uses slot ${mainAgentSlot}, sub-agents use [${sas.join(",") || "none"}]`);
+
+	/**
+	 * Detect backend capabilities by probing /props and /models/sse endpoints.
+	 * Sets supportsPropsEndpoint and supportsSSEProgress flags.
+	 */
+	async function detectBackendCapabilities(): Promise<void> {
+		const propsUrl = baseUrl.replace(/\/v1$/, "") + "/props";
+		const sseUrl = baseUrl.replace(/\/v1$/, "") + "/models/sse";
+
+		// Probe /props endpoint
+		try {
+			const propsResp = await fetch(propsUrl, { signal: AbortSignal.timeout(5000) });
+			if (propsResp.status === 404 || propsResp.status === 501) {
+				supportsPropsEndpoint = false;
+				console.log(`[llama-cpp] /props not supported (status ${propsResp.status}), using FastFlowLM-compatible mode`);
+			} else if (propsResp.ok) {
+				supportsPropsEndpoint = true;
+				console.log(`[llama-cpp] /props endpoint available`);
+			}
+		} catch (err) {
+			// Connection error or timeout — assume llama.cpp but log warning
+			console.warn(`[llama-cpp] could not probe /props: ${(err as Error).message}`);
+		}
+
+		// Probe /models/sse endpoint
+		try {
+			const sseResp = await fetch(sseUrl, { signal: AbortSignal.timeout(5000) });
+			if (sseResp.status === 404 || sseResp.status === 501) {
+				supportsSSEProgress = false;
+				console.log(`[llama-cpp] /models/sse not supported (status ${sseResp.status}), loading progress unavailable`);
+			} else if (sseResp.ok) {
+				supportsSSEProgress = true;
+				console.log(`[llama-cpp] /models/sse endpoint available`);
+			}
+		} catch (err) {
+			// Connection error or timeout
+			console.warn(`[llama-cpp] could not probe /models/sse: ${(err as Error).message}`);
+		}
+
+		// If both endpoints missing, assume FastFlowLM
+		if (!supportsPropsEndpoint && !supportsSSEProgress) {
+			flmMode = true;
+			console.log(`[llama-cpp] Backend appears to be FastFlowLM/AMD NPU — using compatible mode`);
+		}
+	}
 
 	async function refreshProvider(): Promise<void> {
 		try {
@@ -291,8 +363,11 @@ export default async function (pi: ExtensionAPI) {
 				if (isLoaded) {
 					suffixes.push("(loaded)");
 				}
+				// Use FastFlowLM default context if in FLM mode and no metadata available.
+				const flmContext = model.meta?.n_ctx ?? previous?.contextWindow;
 				const contextWindow =
-					model.meta?.n_ctx ?? previous?.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+					model.meta?.n_ctx ?? previous?.contextWindow ??
+					(flmMode ? FLM_DEFAULT_CONTEXT_WINDOW : DEFAULT_CONTEXT_WINDOW);
 				const displayName = model.aliases?.[0] || model.id;
 				return {
 					id: model.id,
@@ -351,6 +426,12 @@ export default async function (pi: ExtensionAPI) {
 		ctx: ExtensionCtx,
 		loader: Loader,
 	): Promise<void> {
+		// Skip if SSE progress is not supported (FastFlowLM/AMD NPU)
+		if (!supportsSSEProgress) {
+			console.log(`[llama-cpp] skipping SSE progress (not supported by backend)`);
+			return;
+		}
+
 		// Close any existing SSE connection
 		if (sseAbortController) {
 			sseAbortController.abort();
@@ -521,7 +602,6 @@ export default async function (pi: ExtensionAPI) {
 		propsAbortController = new AbortController();
 		const timer = setTimeout(() => propsAbortController.abort(), timeoutMs);
 		const shouldAutoload = autoload && !isLoaded;
-		const propsUrl = `${baseUrl.replace(/\/v1$/, "")}/props?model=${encodeURIComponent(modelId)}&autoload=${shouldAutoload}`;
 		const clearFooterStatusLater = () => {
 			clearFooterStatusTimeout();
 			statusTimeout = setTimeout(() => {
@@ -531,6 +611,27 @@ export default async function (pi: ExtensionAPI) {
 		};
 
 		try {
+			// FastFlowLM/AMD NPU mode: skip /props call, use metadata from /v1/models
+			if (!supportsPropsEndpoint) {
+				// Extract context window from /v1/models response if available
+				const nCtx = model.meta?.n_ctx;
+				if (nCtx && nCtx > 0) {
+					model.contextWindow = nCtx;
+					model.maxTokens = Math.min(DEFAULT_MAX_TOKENS, nCtx);
+				}
+				discoveredMetadata.add(modelId);
+				if (shouldAutoload && ctx) {
+					// Show simple status instead of loading indicator
+					const statusMsg = `[llama.cpp] ${displayName} ${isLoaded ? "loaded" : "ready"}`;
+					ctx.ui.setWidget(PROVIDER_ID, [
+						ctx.ui.theme.fg("success", "✓") + ctx.ui.theme.fg("text", ` ${statusMsg}`),
+					]);
+					clearFooterStatusLater();
+				}
+				return;
+			}
+
+			// llama.cpp mode: show loading indicator and start SSE progress
 			if (shouldAutoload && ctx) {
 				let loader = null;
 				ctx.ui.setWidget(PROVIDER_ID, (ui, theme) => {
@@ -554,6 +655,7 @@ export default async function (pi: ExtensionAPI) {
 				void connectToLoadingProgress(modelId, ctx, loader);
 			}
 
+			const propsUrl = `${baseUrl.replace(/\/v1$/, "")}/props?model=${encodeURIComponent(modelId)}&autoload=${shouldAutoload}`;
 			const response = await fetch(propsUrl, { signal: propsAbortController.signal });
 			if (!response.ok) {
 				// 500 during autoload is expected when the server cancels a load to start
