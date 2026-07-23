@@ -350,6 +350,7 @@ export default async function (pi: ExtensionAPI) {
 	let lastFlmUsage: FlmUsage | null = null;
 	let flmUsageUpdateTime = 0;
 	const FLM_USAGE_TTL_MS = 60_000; // 1 minute TTL for context window estimate
+	let flmFooterTimeout: ReturnType<typeof setTimeout> | undefined;
 
 	pi.registerCommand("llama-version", {
 		description: "Get build info of llama.cpp server",
