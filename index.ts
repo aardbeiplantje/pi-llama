@@ -42,6 +42,126 @@ let supportsSSEProgress = true;
 let flmMode = false;
 
 // ---------------------------------------------------------------------------
+// FastFlowLM chat-completion response usage — parsed from /chat/completions
+// responses since /props is unavailable on FLM backends.
+// ---------------------------------------------------------------------------
+
+/** Shape of the `usage` block in an FLM chat-completion response. */
+interface FlmUsage {
+	prompt_tokens: number;
+	completion_tokens: number;
+	total_tokens: number;
+	kv_token_occupancy_rate_percentage?: number; // KV-cache utilisation (%) — 0–1
+	load_duration?: number;                   // total load time (s)
+	prefill_duration_ttft?: number;           // time-to-first-token (s)
+	decoding_duration?: number;              // total decoding wall-time (s)
+	prefill_speed_tps?: number;              // prefill throughput (tok/s)
+	decoding_speed_tps?: number;             // decode throughput (tok/s)
+}
+
+/** Parse raw `usage` from an FLM response, coercing floats and clamping. */
+function parseFlmUsage(raw: unknown): FlmUsage | null {
+	if (raw == null || typeof raw !== "object") return null;
+	const u = raw as Record<string, unknown>;
+	const pt = u.prompt_tokens;
+	const ct = u.completion_tokens;
+	const tt = u.total_tokens;
+	if (typeof pt !== "number" || typeof ct !== "number" || typeof tt !== "number") return null;
+	return {
+		prompt_tokens: pt,
+		completion_tokens: ct,
+		total_tokens: tt,
+		kv_token_occupancy_rate_percentage:
+			typeof u.kv_token_occupancy_rate_percentage === "number"
+				? Math.min(1, Math.max(0, u.kv_token_occupancy_rate_percentage))
+				: undefined,
+		load_duration: typeof u.load_duration === "number" ? u.load_duration : undefined,
+		prefill_duration_ttft: typeof u.prefill_duration_ttft === "number" ? u.prefill_duration_ttft : undefined,
+		decoding_duration: typeof u.decoding_duration === "number" ? u.decoding_duration : undefined,
+		prefill_speed_tps: typeof u.prefill_speed_tps === "number" ? u.prefill_speed_tps : undefined,
+		decoding_speed_tps: typeof u.decoding_speed_tps === "number" ? u.decoding_speed_tps : undefined,
+	};
+}
+
+/** Human-readable summary of an FLM usage block. */
+function flmUsageSummary(u: FlmUsage): string {
+	const parts: string[] = [];
+	if (typeof u.kv_token_occupancy_rate_percentage === "number") {
+		parts.push(`KV ${(u.kv_token_occupancy_rate_percentage * 100).toFixed(1)}%`);
+	}
+	if (typeof u.prefill_speed_tps === "number") {
+		parts.push(`prefill ${u.prefill_speed_tps.toFixed(1)} t/s`);
+	}
+	if (typeof u.decoding_speed_tps === "number") {
+		parts.push(`decode ${u.decoding_speed_tps.toFixed(1)} t/s`);
+	}
+	return parts.length > 0 ? `[flm ${parts.join(" ")}]` : "";
+}
+
+/**
+ * Update model context window based on FLM KV occupancy.
+ * If occupancy is 50% and we've used 2000 tokens, estimate total ctx = 4000.
+ */
+function updateContextWindowFromFlmUsage(modelId: string, usage: FlmUsage): void {
+	const model = currentModels.find(m => m.id === modelId);
+	if (!model || typeof usage.kv_token_occupancy_rate_percentage !== "number") return;
+
+	const occupancy = usage.kv_token_occupancy_rate_percentage;
+	if (occupancy <= 0 || occupancy > 1) return;
+
+	const tokensUsed = usage.prompt_tokens + usage.completion_tokens;
+	const estimatedCtx = Math.ceil(tokensUsed / occupancy);
+
+	// Only update if estimate is larger than current (conservative growth)
+	if (estimatedCtx > model.contextWindow) {
+		model.contextWindow = estimatedCtx;
+		model.maxTokens = Math.min(DEFAULT_MAX_TOKENS, estimatedCtx);
+		console.log(`[llama-cpp] Updated ${modelId} context: ${model.contextWindow} (from KV occupancy ${(occupancy * 100).toFixed(1)}%)`);
+		// Re-register provider to propagate changes
+		try {
+			pi.registerProvider(PROVIDER_ID, {
+				name: "llama.cpp",
+				baseUrl,
+				apiKey,
+				api: "openai-completions",
+				models: currentModels,
+			});
+		} catch (e) {
+			// Ignore if session is gone
+		}
+	}
+}
+
+/** Get FLM usage stats for footer display (within TTL). */
+function getValidFlmUsage(): FlmUsage | null {
+	if (!lastFlmUsage) return null;
+	if (Date.now() - flmUsageUpdateTime > FLM_USAGE_TTL_MS) {
+		lastFlmUsage = null;
+		return null;
+	}
+	return lastFlmUsage;
+}
+
+/** Build footer stats string from FLM usage. */
+function buildFlmFooterStats(): string | undefined {
+	const usage = getValidFlmUsage();
+	if (!usage) return undefined;
+
+	const parts: string[] = [];
+	if (typeof usage.decoding_speed_tps === "number" && usage.decoding_speed_tps > 0) {
+		parts.push(`⚡ ${usage.decoding_speed_tps.toFixed(1)}t/s`);
+	}
+	if (typeof usage.prefill_speed_tps === "number" && usage.prefill_speed_tps > 0) {
+		parts.push(`📥 ${usage.prefill_speed_tps.toFixed(1)}t/s`);
+	}
+	if (typeof usage.kv_token_occupancy_rate_percentage === "number") {
+		parts.push(`📊 ${(usage.kv_token_occupancy_rate_percentage * 100).toFixed(0)}%`);
+	}
+
+	return parts.length > 0 ? parts.join(" ") : undefined;
+}
+
+// ---------------------------------------------------------------------------
 // Slot pool allocator — parses LLAMA_SLOT_ID as a range (e.g. "0-3") and
 // auto-assigns slots from the pool. Sub-agents get their own slot so the
 // main agent's KV cache is never evicted.
@@ -225,6 +345,11 @@ function isStaleContextError(error: unknown): boolean {
 
 export default async function (pi: ExtensionAPI) {
 	let currentModels: LlamaModel[] = [];
+
+	// FLM usage metrics — updated from chat/completions response.usage
+	let lastFlmUsage: FlmUsage | null = null;
+	let flmUsageUpdateTime = 0;
+	const FLM_USAGE_TTL_MS = 60_000; // 1 minute TTL for context window estimate
 
 	pi.registerCommand("llama-version", {
 		description: "Get build info of llama.cpp server",
@@ -418,6 +543,10 @@ export default async function (pi: ExtensionAPI) {
 		if (statusTimeout !== undefined) {
 			clearTimeout(statusTimeout);
 			statusTimeout = undefined;
+		}
+		if (flmFooterTimeout !== undefined) {
+			clearTimeout(flmFooterTimeout);
+			flmFooterTimeout = undefined;
 		}
 	}
 
@@ -623,9 +752,11 @@ export default async function (pi: ExtensionAPI) {
 				discoveredMetadata.add(modelId);
 				if (shouldAutoload && ctx) {
 					// Show simple status instead of loading indicator
+					const footerStats = buildFlmFooterStats();
 					const statusMsg = `[llama.cpp] ${displayName} ${isLoaded ? "loaded" : "ready"}`;
+					const statusLine = footerStats ? `${statusMsg} · ${footerStats}` : statusMsg;
 					ctx.ui.setWidget(PROVIDER_ID, [
-						ctx.ui.theme.fg("success", "✓") + ctx.ui.theme.fg("text", ` ${statusMsg}`),
+						ctx.ui.theme.fg("success", "✓") + ctx.ui.theme.fg("text", ` ${statusLine}`),
 					]);
 					clearFooterStatusLater();
 				}
@@ -703,16 +834,39 @@ export default async function (pi: ExtensionAPI) {
 			}
 			if (loadedFooterStatus && ctx && !isLoaded) {
 				const prefix = ctx.ui.theme.fg("success", "[llama.cpp] ✓");
+				const footerStats = buildFlmFooterStats();
+				const loadedMsg = ` ${displayName}: Loaded` + (nCtx ? ` with context ${nCtx} tokens` : "");
+				const statusLine = footerStats ? `${loadedMsg} · ${footerStats}` : loadedMsg;
 				ctx.ui.setWidget(PROVIDER_ID, [
-					prefix +
-						ctx.ui.theme.fg(
-							"text",
-							` ${displayName}: Loaded` + (nCtx ? ` with context ${nCtx} tokens` : ""),
-						),
+					prefix + ctx.ui.theme.fg("text", statusLine),
 				]);
 				clearFooterStatusLater();
+				// Auto-clear footer stats after TTL
+				if (footerStats) {
+					if (flmFooterTimeout) clearTimeout(flmFooterTimeout);
+					flmFooterTimeout = setTimeout(() => {
+						flmFooterTimeout = undefined;
+						ctx?.ui.setWidget(PROVIDER_ID, [prefix + ctx.ui.theme.fg("text", loadedMsg)]);
+					}, FLM_USAGE_TTL_MS);
+				}
 			}
 			if (!updated) {
+				// Even if /props didn't update metadata, show FLM stats if available
+				if (shouldAutoload && ctx) {
+					const footerStats = buildFlmFooterStats();
+					if (footerStats) {
+						const prefix = ctx.ui.theme.fg("success", "[llama.cpp] ✓");
+						const loadedMsg = ` ${displayName}: Loaded`;
+						ctx.ui.setWidget(PROVIDER_ID, [
+							prefix + ctx.ui.theme.fg("text", `${loadedMsg} · ${footerStats}`),
+						]);
+						if (flmFooterTimeout) clearTimeout(flmFooterTimeout);
+						flmFooterTimeout = setTimeout(() => {
+							flmFooterTimeout = undefined;
+							ctx?.ui.setWidget(PROVIDER_ID, [prefix + ctx.ui.theme.fg("text", loadedMsg)]);
+						}, FLM_USAGE_TTL_MS);
+					}
+				}
 				return;
 			}
 			pi.registerProvider(PROVIDER_ID, {
@@ -875,6 +1029,41 @@ export default async function (pi: ExtensionAPI) {
 			ctx.ui.notify(`[llama-cpp] WARNING: payload is null/undefined, id_slot NOT injected`, "warning");
 		}
 	});
+
+	// Capture FLM usage from chat/completions response (only in FLM mode)
+	// Note: This assumes pi.dev provides an after_provider_response event.
+	// If not available, usage data would need to be captured elsewhere.
+	try {
+		(pi as any).on("after_provider_response", (event, ctx) => {
+			if (!flmMode) return;
+			const modelId = (event.payload as { model?: unknown })?.model;
+			if (typeof modelId !== "string") return;
+			
+			// Extract usage from response
+			const usageRaw = (event.payload as { usage?: unknown })?.usage;
+			if (!usageRaw) return;
+			
+			const usage = parseFlmUsage(usageRaw);
+			if (!usage) return;
+			
+			// Update FLM usage state
+			lastFlmUsage = usage;
+			flmUsageUpdateTime = Date.now();
+			
+			// Update context window estimate
+			updateContextWindowFromFlmUsage(modelId, usage);
+			
+			// Update footer if model is active
+			if (ctx.model?.provider === PROVIDER_ID && ctx.model.id === modelId) {
+				const footerStats = buildFlmFooterStats();
+				if (footerStats) {
+					ctx.ui.setWidget(PROVIDER_ID, [ctx.ui.theme.fg("dim", footerStats)]);
+				}
+			}
+		});
+	} catch (e) {
+		// after_provider_response event not available — FLM stats will only show from last known usage
+	}
 
 	pi.on("session_shutdown", () => {
 		clearFooterStatusTimeout();
