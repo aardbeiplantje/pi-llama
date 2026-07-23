@@ -429,7 +429,7 @@ export default async function (pi: ExtensionAPI) {
 	): Promise<void> {
 		// Skip if SSE progress is not supported (FastFlowLM/AMD NPU)
 		if (!supportsSSEProgress) {
-			console.log(`[llama-cpp] skipping SSE progress (not supported by backend)`);
+			ctx.ui.notify(`[llama-cpp] skipping SSE progress (not supported by backend)`, "info");
 			return;
 		}
 
@@ -812,18 +812,18 @@ export default async function (pi: ExtensionAPI) {
 		// Sub-agent sessions have names like "Explore#a1b2c3d4"
 		try {
 			const sessionName = ctx.sessionManager?.getSessionName?.() ?? "";
-			console.log(`[llama-cpp] before_provider_request: sessionName="${sessionName}" currentSlotId=${currentSlotId}`);
+			ctx.ui.notify(`[llama-cpp] before_provider_request: sessionName="${sessionName}" currentSlotId=${currentSlotId}`, "info");
 			if (sessionName && sessionName.includes("#")) {
 				// Extract agent ID from session name (format: "Type#agentId")
 				const parts = sessionName.split("#");
 				const agentId = parts.length > 1 ? parts[1] : sessionName;
 				if (ssubAgentSlots.has(agentId)) {
 					requestSlotId = ssubAgentSlots.get(agentId)!;
-					console.log(`[llama-cpp] sub-agent ${agentId} using slot ${requestSlotId}`);
+					ctx.ui.notify(`[llama-cpp] sub-agent ${agentId} using slot ${requestSlotId}`, "info");
 				}
 			}
 		} catch (err) {
-			console.log(`[llama-cpp] session name access failed: ${(err as Error).message}`);
+			ctx.ui.notify(`[llama-cpp] session name access failed: ${(err as Error).message}`, "warning");
 			// Session name access failed — use main agent slot
 		}
 
@@ -831,7 +831,19 @@ export default async function (pi: ExtensionAPI) {
 		const payload = event.payload as { [key: string]: unknown } | undefined;
 		if (payload && typeof payload === "object") {
 			(payload as Record<string, unknown>).id_slot = requestSlotId;
-			console.log(`[llama-cpp] injected id_slot=${requestSlotId} into request`);
+			ctx.ui.notify(`[llama-cpp] injected id_slot=${requestSlotId} into request`, "info");
+
+			// Inject max_tokens from the active model metadata
+			const modelId = (event.payload as { model?: unknown })?.model;
+			if (typeof modelId === "string") {
+				const activeModel = currentModels.find(m => m.id === modelId);
+				if (activeModel && typeof activeModel.maxTokens === "number" && activeModel.maxTokens > 0) {
+					(payload as Record<string, unknown>).max_tokens = activeModel.maxTokens;
+					ctx.ui.notify(`[llama-cpp] injected max_tokens=${activeModel.maxTokens} for model ${modelId}`, "info");
+				} else {
+					ctx.ui.notify(`[llama-cpp] WARNING: could not find maxTokens for model ${modelId}`, "warning");
+				}
+			}
 
 			// Sanitize messages: map "developer" role to "system" (llama.cpp compatibility)
 			if (Array.isArray((payload as Record<string, unknown>).messages)) {
@@ -851,16 +863,16 @@ export default async function (pi: ExtensionAPI) {
 							// If first message is not system, prepend a system message
 							const systemMsg = { role: "system", content: "You are a helpful assistant." };
 							sanitized.unshift(systemMsg);
-							console.log(`[llama-cpp] ensured first message is system role (was: ${firstRole})`);
+							ctx.ui.notify(`[llama-cpp] ensured first message is system role (was: ${firstRole})`, "info");
 						} else {
-							console.log(`[llama-cpp] sanitized messages: developer → system, first message already system`);
+							ctx.ui.notify(`[llama-cpp] sanitized messages: developer → system, first message already system`, "info");
 						}
 					}
 				}
 				(payload as Record<string, unknown>).messages = sanitized;
 			}
 		} else {
-			console.log(`[llama-cpp] WARNING: payload is null/undefined, id_slot NOT injected`);
+			ctx.ui.notify(`[llama-cpp] WARNING: payload is null/undefined, id_slot NOT injected`, "warning");
 		}
 	});
 
