@@ -299,7 +299,7 @@ export default async function (pi: ExtensionAPI) {
 			const propsResp = await fetch(propsUrl, { signal: AbortSignal.timeout(5000) });
 			if (propsResp.status === 404 || propsResp.status === 501) {
 				supportsPropsEndpoint = false;
-				ctx.ui.notify(`[llama-cpp] /props not supported (status ${propsResp.status}), using FastFlowLM-compatible mode`, "info");
+				console.log(`[llama-cpp] /props not supported (status ${propsResp.status}), using FastFlowLM-compatible mode`);
 			} else if (propsResp.ok) {
 				supportsPropsEndpoint = true;
 				console.log(`[llama-cpp] /props endpoint available`);
