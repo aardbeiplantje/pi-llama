@@ -827,11 +827,23 @@ export default async function (pi: ExtensionAPI) {
 			// Session name access failed — use main agent slot
 		}
 
-		// Inject id_slot into the request payload (llama.cpp expects "id_slot", not "slot_id")
+		// Inject id_slot and max_tokens into the request payload
 		const payload = event.payload as { [key: string]: unknown } | undefined;
 		if (payload && typeof payload === "object") {
 			(payload as Record<string, unknown>).id_slot = requestSlotId;
 			console.log(`[llama-cpp] injected id_slot=${requestSlotId} into request`);
+
+			// Inject max_tokens from the active model metadata
+			const modelId = (event.payload as { model?: unknown })?.model;
+			if (typeof modelId === "string") {
+				const activeModel = currentModels.find(m => m.id === modelId);
+				if (activeModel && typeof activeModel.maxTokens === "number" && activeModel.maxTokens > 0) {
+					(payload as Record<string, unknown>).max_tokens = activeModel.maxTokens;
+					console.log(`[llama-cpp] injected max_tokens=${activeModel.maxTokens} for model ${modelId}`);
+				} else {
+					console.log(`[llama-cpp] WARNING: could not find maxTokens for model ${modelId}`);
+				}
+			}
 
 			// Sanitize messages: map "developer" role to "system" (llama.cpp compatibility)
 			if (Array.isArray((payload as Record<string, unknown>).messages)) {
