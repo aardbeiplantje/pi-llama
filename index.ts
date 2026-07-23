@@ -98,69 +98,6 @@ function flmUsageSummary(u: FlmUsage): string {
 	return parts.length > 0 ? `[flm ${parts.join(" ")}]` : "";
 }
 
-/**
- * Update model context window based on FLM KV occupancy.
- * If occupancy is 50% and we've used 2000 tokens, estimate total ctx = 4000.
- */
-function updateContextWindowFromFlmUsage(modelId: string, usage: FlmUsage): void {
-	const model = currentModels.find(m => m.id === modelId);
-	if (!model || typeof usage.kv_token_occupancy_rate_percentage !== "number") return;
-
-	const occupancy = usage.kv_token_occupancy_rate_percentage;
-	if (occupancy <= 0 || occupancy > 1) return;
-
-	const tokensUsed = usage.prompt_tokens + usage.completion_tokens;
-	const estimatedCtx = Math.ceil(tokensUsed / occupancy);
-
-	// Only update if estimate is larger than current (conservative growth)
-	if (estimatedCtx > model.contextWindow) {
-		model.contextWindow = estimatedCtx;
-		model.maxTokens = Math.min(DEFAULT_MAX_TOKENS, estimatedCtx);
-		console.log(`[llama-cpp] Updated ${modelId} context: ${model.contextWindow} (from KV occupancy ${(occupancy * 100).toFixed(1)}%)`);
-		// Re-register provider to propagate changes
-		try {
-			pi.registerProvider(PROVIDER_ID, {
-				name: "llama.cpp",
-				baseUrl,
-				apiKey,
-				api: "openai-completions",
-				models: currentModels,
-			});
-		} catch (e) {
-			// Ignore if session is gone
-		}
-	}
-}
-
-/** Get FLM usage stats for footer display (within TTL). */
-function getValidFlmUsage(): FlmUsage | null {
-	if (!lastFlmUsage) return null;
-	if (Date.now() - flmUsageUpdateTime > FLM_USAGE_TTL_MS) {
-		lastFlmUsage = null;
-		return null;
-	}
-	return lastFlmUsage;
-}
-
-/** Build footer stats string from FLM usage. */
-function buildFlmFooterStats(): string | undefined {
-	const usage = getValidFlmUsage();
-	if (!usage) return undefined;
-
-	const parts: string[] = [];
-	if (typeof usage.decoding_speed_tps === "number" && usage.decoding_speed_tps > 0) {
-		parts.push(`⚡ ${usage.decoding_speed_tps.toFixed(1)}t/s`);
-	}
-	if (typeof usage.prefill_speed_tps === "number" && usage.prefill_speed_tps > 0) {
-		parts.push(`📥 ${usage.prefill_speed_tps.toFixed(1)}t/s`);
-	}
-	if (typeof usage.kv_token_occupancy_rate_percentage === "number") {
-		parts.push(`📊 ${(usage.kv_token_occupancy_rate_percentage * 100).toFixed(0)}%`);
-	}
-
-	return parts.length > 0 ? parts.join(" ") : undefined;
-}
-
 // ---------------------------------------------------------------------------
 // Slot pool allocator — parses LLAMA_SLOT_ID as a range (e.g. "0-3") and
 // auto-assigns slots from the pool. Sub-agents get their own slot so the
@@ -549,6 +486,69 @@ export default async function (pi: ExtensionAPI) {
 			clearTimeout(flmFooterTimeout);
 			flmFooterTimeout = undefined;
 		}
+	}
+
+	/**
+	 * Update model context window based on FLM KV occupancy.
+	 * If occupancy is 50% and we've used 2000 tokens, estimate total ctx = 4000.
+	 */
+	function updateContextWindowFromFlmUsage(modelId: string, usage: FlmUsage): void {
+		const model = currentModels.find(m => m.id === modelId);
+		if (!model || typeof usage.kv_token_occupancy_rate_percentage !== "number") return;
+
+		const occupancy = usage.kv_token_occupancy_rate_percentage;
+		if (occupancy <= 0 || occupancy > 1) return;
+
+		const tokensUsed = usage.prompt_tokens + usage.completion_tokens;
+		const estimatedCtx = Math.ceil(tokensUsed / occupancy);
+
+		// Only update if estimate is larger than current (conservative growth)
+		if (estimatedCtx > model.contextWindow) {
+			model.contextWindow = estimatedCtx;
+			model.maxTokens = Math.min(DEFAULT_MAX_TOKENS, estimatedCtx);
+			console.log(`[llama-cpp] Updated ${modelId} context: ${model.contextWindow} (from KV occupancy ${(occupancy * 100).toFixed(1)}%)`);
+			// Re-register provider to propagate changes
+			try {
+				pi.registerProvider(PROVIDER_ID, {
+					name: "llama.cpp",
+					baseUrl,
+					apiKey,
+					api: "openai-completions",
+					models: currentModels,
+				});
+			} catch (e) {
+				// Ignore if session is gone
+			}
+		}
+	}
+
+	/** Get FLM usage stats for footer display (within TTL). */
+	function getValidFlmUsage(): FlmUsage | null {
+		if (!lastFlmUsage) return null;
+		if (Date.now() - flmUsageUpdateTime > FLM_USAGE_TTL_MS) {
+			lastFlmUsage = null;
+			return null;
+		}
+		return lastFlmUsage;
+	}
+
+	/** Build footer stats string from FLM usage. */
+	function buildFlmFooterStats(): string | undefined {
+		const usage = getValidFlmUsage();
+		if (!usage) return undefined;
+
+		const parts: string[] = [];
+		if (typeof usage.decoding_speed_tps === "number" && usage.decoding_speed_tps > 0) {
+			parts.push(`⚡ ${usage.decoding_speed_tps.toFixed(1)}t/s`);
+		}
+		if (typeof usage.prefill_speed_tps === "number" && usage.prefill_speed_tps > 0) {
+			parts.push(`📥 ${usage.prefill_speed_tps.toFixed(1)}t/s`);
+		}
+		if (typeof usage.kv_token_occupancy_rate_percentage === "number") {
+			parts.push(`📊 ${(usage.kv_token_occupancy_rate_percentage * 100).toFixed(0)}%`);
+		}
+
+		return parts.length > 0 ? parts.join(" ") : undefined;
 	}
 
 	// Connect to SSE stream for model loading progress
