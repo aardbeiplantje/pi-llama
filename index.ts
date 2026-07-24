@@ -366,6 +366,20 @@ export default async function (pi: ExtensionAPI) {
 			} else if (propsResp.ok) {
 				supportsPropsEndpoint = true;
 				console.log(`[llama-cpp] /props endpoint available`);
+			} else if (propsResp.status >= 500) {
+				// Server error (5xx) — endpoint exists but server is busy/unavailable
+				// Don't assume it's not supported; try to use it anyway and let /props call handle errors
+				console.warn(`[llama-cpp] /props returned 5xx (status ${propsResp.status}), treating as available but may be temporarily unavailable`);
+				supportsPropsEndpoint = true;
+			} else if (propsResp.status >= 400) {
+				// Client error (4xx) — endpoint exists but returns error
+				// Don't assume it's not supported; try to use it anyway
+				console.warn(`[llama-cpp] /props returned 4xx (status ${propsResp.status}), treating as available but may be temporarily unavailable`);
+				supportsPropsEndpoint = true;
+			} else {
+				// Other status codes (e.g., 200, 201, etc.) — treat as available
+				supportsPropsEndpoint = true;
+				console.log(`[llama-cpp] /props endpoint available`);
 			}
 		} catch (err) {
 			// Connection error or timeout — assume llama.cpp but log warning
@@ -379,6 +393,20 @@ export default async function (pi: ExtensionAPI) {
 				supportsSSEProgress = false;
 				console.log(`[llama-cpp] /models/sse not supported (status ${sseResp.status}), loading progress unavailable`);
 			} else if (sseResp.ok) {
+				supportsSSEProgress = true;
+				console.log(`[llama-cpp] /models/sse endpoint available`);
+			} else if (sseResp.status >= 500) {
+				// Server error (5xx) — endpoint exists but server is busy/unavailable
+				// Don't assume it's not supported; try to use it anyway and let SSE connection handle errors
+				console.warn(`[llama-cpp] /models/sse returned 5xx (status ${sseResp.status}), treating as available but may be temporarily unavailable`);
+				supportsSSEProgress = true;
+			} else if (sseResp.status >= 400) {
+				// Client error (4xx) — endpoint exists but returns error
+				// Don't assume it's not supported; try to use it anyway
+				console.warn(`[llama-cpp] /models/sse returned 4xx (status ${sseResp.status}), treating as available but may be temporarily unavailable`);
+				supportsSSEProgress = true;
+			} else {
+				// Other status codes (e.g., 200, 201, etc.) — treat as available
 				supportsSSEProgress = true;
 				console.log(`[llama-cpp] /models/sse endpoint available`);
 			}
@@ -494,7 +522,7 @@ export default async function (pi: ExtensionAPI) {
 	 */
 	function updateContextWindowFromFlmUsage(modelId: string, usage: FlmUsage): void {
 		const model = currentModels.find(m => m.id === modelId);
-		if (!model || typeof usage.kv_token_occupancy_rate_percentage !== "number") return;
+		if (!model || usage.kv_token_occupancy_rate_percentage === undefined) return;
 
 		const occupancy = usage.kv_token_occupancy_rate_percentage;
 		if (occupancy <= 0 || occupancy > 1) return;
@@ -576,8 +604,12 @@ export default async function (pi: ExtensionAPI) {
 			const response = await fetch(`${baseUrl.replace(/\/v1$/, "")}/models/sse`, { signal });
 
 			if (!response.ok) {
-				if (response.status !== 404) {
-					ctx?.ui.notify(`[llama-cpp] loading progress ${response.status})`, "warning");
+				if (response.status === 404) {
+					ctx?.ui.notify(`[llama-cpp] SSE endpoint not found (404)`, "warning");
+				} else if (response.status >= 500) {
+					ctx?.ui.notify(`[llama-cpp] SSE endpoint returned 5xx (status ${response.status}) — server error`, "warning");
+				} else if (response.status >= 400) {
+					ctx?.ui.notify(`[llama-cpp] SSE endpoint returned 4xx (status ${response.status}) — client error`, "warning");
 				}
 				return;
 			}
