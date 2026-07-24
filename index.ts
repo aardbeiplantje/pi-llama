@@ -318,7 +318,12 @@ export default async function (pi: ExtensionAPI) {
 		},
 	});
 
-	const baseUrl = (process.env.LLAMA_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
+	// Support both LLAMA_BASE_URL and LLAMA_SERVER_URL naming conventions
+	const baseUrlEnv = process.env.LLAMA_BASE_URL || process.env.LLAMA_SERVER_URL;
+	if (!baseUrlEnv) {
+		console.warn(`[llama-cpp] WARNING: Neither LLAMA_BASE_URL nor LLAMA_SERVER_URL set`);
+	}
+	const baseUrl = (baseUrlEnv ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
 	const apiKey = process.env.LLAMA_API_KEY ?? "no-key";
 	// Detect FastFlowLM mode — either forced via env var or auto-detected.
 	flmMode = process.env.LLAMA_FLM_MODE === "1" || process.env.LLAMA_FLM_MODE === "true";
