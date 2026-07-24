@@ -336,6 +336,44 @@ export default async function (pi: ExtensionAPI) {
 	}
 
 	// -----------------------------------------------------------------------
+	// Install FLM usage capture wrapper (intercepts raw API responses)
+	// This captures extended stats before pi.dev normalizes them away.
+	// -----------------------------------------------------------------------
+	if (flmMode && typeof globalThis.fetch === "function") {
+		const originalFetch = globalThis.fetch.bind(globalThis);
+		
+		globalThis.fetch = async function(input: any, init?: any): Promise<Response> {
+			try {
+				const urlStr = input instanceof Request ? input.url : String(input);
+				
+				// Only intercept /chat/completions requests to llama.cpp/FLM backend  
+				if (!urlStr.includes(baseUrl)) {
+					return await originalFetch(input, init);
+				}
+				
+				if (urlStr.endsWith("/chat/completions")) {
+					const response = await originalFetch(input, init);
+					
+					// Clone the response so we can read it without consuming the stream
+					const clonedResponse = response.clone();
+					
+					try {
+						const jsonBody = await clonedResponse.json().catch(() => null);
+						
+						if (jsonBody?.usage) {
+							console.log(`[llama-cpp] Captured raw FLM usage from /chat/completions:`);
+	 console.log(JSON.stringify(jsonBody.usage, null, 2));
+                            	                        	                        	        const usage = parseFlmUsage(jsonBody.usage); if (usage) { lastFlmUsage = usage; flmUsageUpdateTime = Date.now(); const modelId: string | undefined = typeof jsonBody.model === "string" ? jsonBody.model : currentModels.length > 0 ? currentModels[0].id : undefined; if (modelId && usage.kv_token_occupancy_rate_percentage !== undefined) { updateContextWindowFromFlmUsage(modelId, usage); } }
+                                                } catch (e) { /* Ignore JSON parsing errors */ }
+                                                return response;
+                                        } else {
+                                                return await originalFetch(input, init);
+                                        }
+                                } catch (error) {
+                                        console.error(`[llama-cpp] fetch wrapper error:`, error);
+                                        throw error;
+                                }
+                        };\n\t\tconsole.log(`[llama-cpp] Installed FLM usage capture wrapper for /chat/completions`);\n\t}\n\n\t// -----------------------------------------------------------------------
 	// Slot pool — parse LLAMA_SLOT_ID as a range and auto-assign slots
 	// Slot 0 is reserved for the main agent IF it's in the pool.
 	// Otherwise the main agent uses the first available slot.
@@ -1070,22 +1108,62 @@ export default async function (pi: ExtensionAPI) {
 		}
 	});
 
+	// Debug logging for FLM usage capture
+	pi.on("message_end", (event: any, ctx) => {
+		console.log(`[DEBUG] message_end fired: role=${event.message?.role}, flmMode=${flmMode}`);
+        	if (event.message?.usage) {
+            console.log('[DEBUG] Usage keys:', Object.keys(event.message.usage));
+            console.log('[DEBUG] Full usage:', JSON.stringify(event.message.usage, null, 2));
+        } else {
+            console.log('[DEBUG] No usage field in message');
+        }
+    });
+
 	// Capture FLM usage from message_end events (only in FLM mode)
-	// The extended FLM stats are attached to assistant messages by the provider layer.
 	pi.on("message_end", (event: any, ctx) => {
 		if (!flmMode || event.message.role !== "assistant") return;
 		
 		// Extract raw usage from the message - this includes all FLM extensions
 		const rawUsage = event.message.usage;
-		if (!rawUsage) return;
+		if (!rawUsage) {
+            console.log('[FLM DEBUG] Skipping - no usage data');
+            return;
+        }
 		
 		const usage = parseFlmUsage(rawUsage);
-		if (!usage) return;
+		if (!usage) {
+            console.log('[FLM DEBUG] Failed to parse usage:', rawUsage);
+            return; 
+        }
+		
+		console.log(`[FLM DEBUG] Captured stats:`, { 
+            active_kv_tokens: usage.active_kv_tokens,
+            max_capacity: usage.max_kv_token_capacity,
+            kv_pct: usage.kv_token_occupancy_rate_percentage,
+            decode_tps: usage.decoding_speed_tps,
+            prefill_tps: usage.prefill_speed_tps 
+        });
 		
 		// Update FLM usage state
 		lastFlmUsage = usage;
 		flmUsageUpdateTime = Date.now();
-	});
+        
+        // Trigger footer update if model is currently selected
+        const currentModelId = pi.model?.id;  // Access via pi directly, not ctx
+        console.log('[FLM DEBUG] Current model:', currentModelId);
+        
+        if (currentModelId) {
+            const footerStats = buildFlmFooterStats();
+            console.log('[FLM DEBUG] Footer stats to display:', footerStats);
+            if (footerStats && typeof pi.ui.setWidget === 'function') {
+                try {
+                    pi.ui.setWidget(PROVIDER_ID, [pi.ui.theme.fg('dim', footerStats)]);
+                    console.log('[FLM DEBUG] Updated widget with stats');
+                } catch(e) {
+                    console.error('[FLM DEBUG] Widget update failed:', e.message);
+                }
+            }
+        }	});
 
 	pi.on("session_shutdown", () => {
 		clearFooterStatusTimeout();
