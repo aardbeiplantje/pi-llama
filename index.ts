@@ -334,7 +334,91 @@ export default async function (pi: ExtensionAPI) {
 	} else {
 		// Auto-detect backend capabilities by probing endpoints.
 		await detectBackendCapabilities();
+	// Install FastFlowLM usage capture to intercept raw HTTP responses before normalization strips custom fields  
+	if (flmMode && typeof globalThis.fetch === "function") {
+		const originalFetch = globalThis.fetch.bind(globalThis);
+		
+		globalThis.fetch = async function(input: any, init?: any): Promise<Response> {
+			try {
+				const urlStr = input instanceof Request ? input.url : String(input);
+				
+				// Only intercept /chat/completions requests to our backend  
+				if (!urlStr.includes(baseUrl)) {
+					return await originalFetch(input, init);
+				}
+				
+				if (urlStr.endsWith("/chat/completions")) {
+					console.log('[FLM DEBUG]', 'Intercepting chat completion request');
+					
+					const response = await originalFetch(input, init);
+					
+					// Clone body so we can read without consuming stream for pi.dev  
+					const clonedResponse = response.clone();
+					
+					try {
+						// Read entire SSE stream as text and parse chunks looking for final [DONE] with usage data  
+						const fullText = await clonedResponse.text();
+						
+						// Parse all events - look from end since that's where usage appears  
+						const lines = fullText.split('\n\n');
+						for (const event of lines.reverse()) {
+							if (!event.startsWith('data: ')) continue;
+							
+							try {
+								const jsonChunk = JSON.parse(event.replace(/^data:\s*/, ''));
+								
+								if (jsonChunk.usage && !lastFlmUsage) { // Capture first valid usage found  
+									console.log(`[FLM DEBUG] Captured streaming FLM usage:`);
+									console.log(JSON.stringify(jsonChunk.usage, null, 2));
+									
+									const parsedUsage = parseFlmUsage(jsonChunk.usage);
+									if (parsedUsage) {
+										lastFlmUsage = parsedUsage;
+										flmUsageUpdateTime = Date.now();
+
+										const modelId: string | undefined = typeof jsonChunk.model === "string" 
+											? jsonChunk.model 
+											: currentModels.length > 0 ? currentModels[0].id : undefined;
+
+										if (modelId && parsedUsage.kv_token_occupancy_rate_percentage !== undefined) {
+											updateContextWindowFromFlmUsage(modelId, parsedUsage);
+										}
+
+										console.log('[FLM DEBUG]', 'Footer will show:', buildFlmFooterStats());
+										
+										// Trigger immediate footer update if this is the active model  
+										if (ctx?.ui && typeof ctx.ui.setWidget === 'function') {
+											try {
+												const stats = buildFlmFooterStats();
+												if (stats) {
+													ctx.ui.setWidget(PROVIDER_ID, [ctx.ui.theme.fg('dim', stats)]);
+												}
+											} catch(e) {/* Ignore UI errors */}
+										}
+									} else {
+										console.error('[FLM ERROR] Failed to parse extended stats');  
+									}
+									break; // Found and processed usage, stop searching  
+								}
+							} catch(e) {/* Ignore non-JSON or malformed chunks */}
+						}
+					} catch(error) {
+						console.warn(`[FLM WARNING] Could not read response body for stats:`, error.message);
+					}
+						
+					return response; // Return original unmodified so pi.dev can still stream it
+                        
+				} else {
+					return await originalFetch(input, init); // Not chat/completions endpoint  
+			} catch(error) {
+				console.error(`[FLM ERROR] Fetch wrapper failed:`, error);
+				throw error; // Re-throw to avoid breaking normal operation  
+		};
+		
+		console.log(`[llama-cpp] Installed FLM streaming interceptor`);
 	}
+
+
 
 	// -----------------------------------------------------------------------
 	// Slot pool — parse LLAMA_SLOT_ID as a range and auto-assign slots
