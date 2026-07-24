@@ -51,9 +51,11 @@ interface FlmUsage {
 	prompt_tokens: number;
 	completion_tokens: number;
 	total_tokens: number;
+	active_kv_tokens?: number;               // active KV tokens currently used
+	max_kv_token_capacity?: number;          // max KV token capacity
 	kv_token_occupancy_rate_percentage?: number; // KV-cache utilisation (%) — 0–1
-	load_duration?: number;                   // total load time (s)
-	prefill_duration_ttft?: number;           // time-to-first-token (s)
+	load_duration?: number;                  // total load time (s)
+	prefill_duration_ttft?: number;          // time-to-first-token (s)
 	decoding_duration?: number;              // total decoding wall-time (s)
 	prefill_speed_tps?: number;              // prefill throughput (tok/s)
 	decoding_speed_tps?: number;             // decode throughput (tok/s)
@@ -71,6 +73,8 @@ function parseFlmUsage(raw: unknown): FlmUsage | null {
 		prompt_tokens: pt,
 		completion_tokens: ct,
 		total_tokens: tt,
+		active_kv_tokens: typeof u.active_kv_tokens === "number" ? u.active_kv_tokens : undefined,
+		max_kv_token_capacity: typeof u.max_kv_token_capacity === "number" ? u.max_kv_token_capacity : undefined,
 		kv_token_occupancy_rate_percentage:
 			typeof u.kv_token_occupancy_rate_percentage === "number"
 				? Math.min(1, Math.max(0, u.kv_token_occupancy_rate_percentage))
@@ -566,14 +570,17 @@ export default async function (pi: ExtensionAPI) {
 		if (!usage) return undefined;
 
 		const parts: string[] = [];
+		// Show KV token capacity if available
+		if (typeof usage.active_kv_tokens === "number" && typeof usage.max_kv_token_capacity === "number") {
+			parts.push(`KV ${usage.active_kv_tokens}/${usage.max_kv_token_capacity}`);
+		} else if (typeof usage.kv_token_occupancy_rate_percentage === "number") {
+			parts.push(`📊 ${(usage.kv_token_occupancy_rate_percentage * 100).toFixed(0)}%`);
+		}
 		if (typeof usage.decoding_speed_tps === "number" && usage.decoding_speed_tps > 0) {
 			parts.push(`⚡ ${usage.decoding_speed_tps.toFixed(1)}t/s`);
 		}
 		if (typeof usage.prefill_speed_tps === "number" && usage.prefill_speed_tps > 0) {
 			parts.push(`📥 ${usage.prefill_speed_tps.toFixed(1)}t/s`);
-		}
-		if (typeof usage.kv_token_occupancy_rate_percentage === "number") {
-			parts.push(`📊 ${(usage.kv_token_occupancy_rate_percentage * 100).toFixed(0)}%`);
 		}
 
 		return parts.length > 0 ? parts.join(" ") : undefined;
@@ -1063,40 +1070,22 @@ export default async function (pi: ExtensionAPI) {
 		}
 	});
 
-	// Capture FLM usage from chat/completions response (only in FLM mode)
-	// Note: This assumes pi.dev provides an after_provider_response event.
-	// If not available, usage data would need to be captured elsewhere.
-	try {
-		(pi as any).on("after_provider_response", (event, ctx) => {
-			if (!flmMode) return;
-			const modelId = (event.payload as { model?: unknown })?.model;
-			if (typeof modelId !== "string") return;
-			
-			// Extract usage from response
-			const usageRaw = (event.payload as { usage?: unknown })?.usage;
-			if (!usageRaw) return;
-			
-			const usage = parseFlmUsage(usageRaw);
-			if (!usage) return;
-			
-			// Update FLM usage state
-			lastFlmUsage = usage;
-			flmUsageUpdateTime = Date.now();
-			
-			// Update context window estimate
-			updateContextWindowFromFlmUsage(modelId, usage);
-			
-			// Update footer if model is active
-			if (ctx.model?.provider === PROVIDER_ID && ctx.model.id === modelId) {
-				const footerStats = buildFlmFooterStats();
-				if (footerStats) {
-					ctx.ui.setWidget(PROVIDER_ID, [ctx.ui.theme.fg("dim", footerStats)]);
-				}
-			}
-		});
-	} catch (e) {
-		// after_provider_response event not available — FLM stats will only show from last known usage
-	}
+	// Capture FLM usage from message_end events (only in FLM mode)
+	// The extended FLM stats are attached to assistant messages by the provider layer.
+	pi.on("message_end", (event: any, ctx) => {
+		if (!flmMode || event.message.role !== "assistant") return;
+		
+		// Extract raw usage from the message - this includes all FLM extensions
+		const rawUsage = event.message.usage;
+		if (!rawUsage) return;
+		
+		const usage = parseFlmUsage(rawUsage);
+		if (!usage) return;
+		
+		// Update FLM usage state
+		lastFlmUsage = usage;
+		flmUsageUpdateTime = Date.now();
+	});
 
 	pi.on("session_shutdown", () => {
 		clearFooterStatusTimeout();
