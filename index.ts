@@ -334,6 +334,7 @@ export default async function (pi: ExtensionAPI) {
 	} else {
 		// Auto-detect backend capabilities by probing endpoints.
 		await detectBackendCapabilities();
+		}
 	// Install FastFlowLM usage capture to intercept raw HTTP responses before normalization strips custom fields  
 	if (flmMode && typeof globalThis.fetch === "function") {
 		const originalFetch = globalThis.fetch.bind(globalThis);
