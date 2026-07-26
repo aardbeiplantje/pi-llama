@@ -1193,4 +1193,4 @@ export default async function (pi: ExtensionAPI) {
 		propsAbortController?.abort();
 		sseAbortController?.abort();
 	});
-}
+}}
