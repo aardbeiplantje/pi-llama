@@ -410,7 +410,8 @@ export default async function (pi: ExtensionAPI) {
 					return response; // Return original unmodified so pi.dev can still stream it
                         
 				} else {
-					return await originalFetch(input, init); // Not chat/completions endpoint  
+					return await originalFetch(input, init); // Not chat/completions endpoint
+				}
 			} catch(error) {
 				console.error(`[FLM ERROR] Fetch wrapper failed:`, error);
 				throw error; // Re-throw to avoid breaking normal operation  
@@ -418,8 +419,6 @@ export default async function (pi: ExtensionAPI) {
 		
 		console.log(`[llama-cpp] Installed FLM streaming interceptor`);
 	}
-
-
 
 	// -----------------------------------------------------------------------
 	// Slot pool — parse LLAMA_SLOT_ID as a range and auto-assign slots
